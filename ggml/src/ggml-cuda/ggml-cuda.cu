@@ -20,6 +20,7 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
+#include "ggml-cuda/delta-net-recurrence.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
@@ -116,6 +117,8 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static bool ggml_cuda_uma_prefetch_enabled();  // forward declaration
+
 static bool ggml_cuda_is_device_uma(int device) {
     // Cache results per device to avoid repeated cudaGetDeviceProperties calls
     static bool cached[GGML_CUDA_MAX_DEVICES] = {};
@@ -136,17 +139,10 @@ static bool ggml_cuda_is_device_uma(int device) {
     }
 
 #if defined(GGML_USE_HIP)
-    // Auto-detect AMD APUs (e.g. Strix Halo) by querying the hardware directly.
-    // The info.devices[id].integrated flag is currently disabled due to #15034,
-    // but we can still use prop.integrated for memory allocation decisions.
-    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device);
-        bool is_uma = (err == cudaSuccess && prop.integrated);
-        results[device] = is_uma;
-        cached[device] = true;
-        return is_uma;
-    }
+    // On HIP, do NOT auto-detect integrated GPUs for UMA allocation.
+    // hipMallocManaged on RDNA 3.5 iGPUs causes runtime crashes.
+    // Users must explicitly set GGML_CUDA_ENABLE_UNIFIED_MEMORY=1.
+    GGML_UNUSED(device);
 #endif
 
     return false;
@@ -303,7 +299,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         // Use spin scheduling for integrated GPUs to reduce synchronization latency
         if (prop.integrated) {
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            cudaError_t flags_err = cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+            if (flags_err != cudaSuccess) {
+                GGML_LOG_WARN("  Device %d: cudaSetDeviceFlags(Spin) failed, ignoring\n", id);
+                (void)cudaGetLastError(); // clear the error
+            }
         }
 
         // Log UMA auto-detection for integrated GPUs
@@ -2804,6 +2804,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_DELTA_NET_RECURRENCE:
+            ggml_cuda_op_delta_net_recurrence(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -4985,6 +4988,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
+        }
+        case GGML_OP_DELTA_NET_RECURRENCE: {
+            // requires S=128 (state dimension)
+            return op->src[1]->ne[0] == 128;
         }
         case GGML_OP_CONT:
             return true;

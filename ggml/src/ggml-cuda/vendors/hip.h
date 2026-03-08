@@ -141,6 +141,10 @@
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaEventCreate hipEventCreate
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaSetDeviceFlags hipSetDeviceFlags
+#define cudaDeviceScheduleSpin hipDeviceScheduleSpin
 #define __trap() do { abort(); __builtin_unreachable(); } while(0)
 #define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
 #define CUBLAS_STATUS_NOT_INITIALIZED HIPBLAS_STATUS_NOT_INITIALIZED

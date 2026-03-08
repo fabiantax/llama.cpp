@@ -8,6 +8,13 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#else
+#include <sys/stat.h>
+#endif
 #include <sys/stat.h>
 #include <unordered_map>
 
