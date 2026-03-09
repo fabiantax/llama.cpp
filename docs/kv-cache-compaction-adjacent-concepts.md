@@ -912,6 +912,356 @@ iteration) while providing stronger theoretical guarantees.
 
 ---
 
+## 19. Sparse Gaussian Processes & Inducing Points
+
+**Maps to: [A] Key Selection + [B] Bias Fitting + [C] Value Fitting**
+
+### What it is
+
+A full Gaussian Process has O(N^3) cost. Sparse GPs introduce M << N
+**inducing points** — pseudo-inputs that summarize the entire dataset. The
+posterior is approximated by conditioning on these M points instead of all N
+data points, reducing cost to O(NM^2). The inducing point locations and the
+variational distribution over their function values are jointly optimized.
+
+### The structural analogy
+
+The analogy is exact:
+
+| Sparse GP | KV Cache Compaction |
+|---|---|
+| Full dataset (N points) | Full KV cache (T tokens) |
+| M inducing points | t compacted KV entries |
+| Inducing points summarize the function | Compacted KV entries summarize the context |
+| Posterior conditioned on inducing points | Attention computed over reduced KV set |
+| Variational bound optimizes inducing locations | Steps 1-3 optimize C_k, beta, C_v |
+| Nyström approximation of kernel matrix | Low-rank approximation of attention matrix |
+
+The compacted KV entries ARE inducing points for the attention kernel.
+
+### What it suggests concretely
+
+**Variational inference for compaction.** Titsias (2009) showed that the
+optimal inducing point locations maximize a variational lower bound on the
+marginal likelihood. Applied to KV compaction: instead of the heuristic
+three-step pipeline, maximize a variational lower bound on the attention
+log-likelihood. This gives a principled objective that jointly optimizes
+key selection, bias, and values.
+
+**Decoupled inducing points.** SGPA (arXiv:2303.02444) introduces "decoupled
+inducing points" — separate per-sample (amortized) and global (shared)
+inducing variables. For KV compaction, this suggests a hybrid: keep some
+globally important keys (high-attention across all queries) plus
+context-specific keys selected per reference query batch.
+
+### Direct application exists
+
+**KEP-SVGP** (Chen et al., ICML 2024, arXiv:2402.01476) recasts self-attention
+as a sparse variational GP. It handles the asymmetric attention kernel (Q*K^T)
+via Kernel SVD, producing two sets of singular vectors that induce paired SVGPs.
+This makes the structural analogy between attention and GPs mathematically
+precise and provides calibrated uncertainty estimates.
+
+### Papers
+- [KEP-SVGP: Self-Attention through Kernel-Eigen Pair Sparse Variational GPs](https://arxiv.org/abs/2402.01476) (ICML 2024)
+- [SGPA: Calibrating Transformers via Sparse Gaussian Processes](https://arxiv.org/abs/2303.02444) (2023)
+- Titsias, "Variational Learning of Inducing Variables in Sparse GPs" (PMLR 2009)
+- [Hensman et al., "GPs for Big Data"](https://arxiv.org/abs/1309.6835) (2013)
+
+---
+
+## 20. Token Merging (ToMe)
+
+**Maps to: [A] Key Selection + [C] Value Fitting**
+
+### What it is
+
+Token Merging (Bolya et al., ICLR 2023) reduces token count by **merging
+redundant tokens** rather than dropping them. The core algorithm:
+
+1. Partition tokens into two sets A, B (e.g., even/odd indices)
+2. Compute cosine similarity between A and B using key vectors (already
+   computed for attention — nearly free)
+3. Find bipartite soft matching: each token in A finds its most similar
+   token in B. Select top-r most similar pairs.
+4. Merge matched pairs by (weighted) averaging, reducing token count by r
+5. Apply progressively at each transformer block
+
+### The structural analogy
+
+Token merging is a form of KV cache compaction where:
+- Key selection = which tokens to merge vs. keep distinct
+- Value fitting = the merged value is a weighted average of original values
+- The similarity metric (key cosine similarity) replaces attention scoring
+
+The critical difference from eviction: **information is preserved, not
+discarded**. A merged token carries the combined signal of both originals.
+
+### What it suggests concretely
+
+**Merge-based compaction as an alternative to subset selection.** Instead of
+picking t of T keys, iteratively merge the most similar pairs until t remain.
+Each merge:
+- Averages the key vectors (new key = centroid of merged cluster)
+- Averages the value vectors (weighted by attention mass)
+- Accumulates beta as log(cluster_size)
+
+This naturally lifts the C_k ⊆ K constraint (merged keys are centroids) while
+preserving information that eviction destroys.
+
+**Graceful degradation.** Merging degrades much more gracefully than eviction at
+high compression ratios — merged tokens still carry aggregate signal. D2O
+(arXiv:2406.13035) confirms this with a hybrid approach: evict clearly
+unimportant tokens, merge borderline ones.
+
+### Papers
+- [Token Merging: Your ViT But Faster](https://arxiv.org/abs/2210.09461) (ICLR 2023)
+- [Token Fusion: Bridging Pruning and Merging](https://arxiv.org/abs/2312.01026) (WACV 2024)
+- [PiToMe: Parallel Informed Token Merging](https://arxiv.org/abs/2405.13828) (2024)
+- [D2O: Dynamic Discriminative Operations](https://arxiv.org/abs/2406.13035) (2024) — eviction + merging hybrid
+
+---
+
+## 21. Submodular Optimization (BumbleBee)
+
+**Maps to: [A] Key Selection + [D] Budget Allocation**
+
+### What it is
+
+A set function f is **submodular** if it satisfies diminishing returns:
+adding an element to a smaller set gives at least as much marginal gain as
+adding it to a larger set. Greedy maximization of monotone submodular functions
+achieves a (1 - 1/e) ≈ 0.63 approximation to the optimum (Nemhauser-Wolsey-
+Fisher theorem, 1978).
+
+### The structural analogy
+
+Key selection IS subset selection maximizing a quality function. If that quality
+function is submodular (or approximately so), greedy selection comes with
+approximation guarantees. The key scoring function needs two properties:
+- **Coverage**: selected keys should collectively explain the attention mass
+- **Diversity**: selecting redundant keys has diminishing returns
+
+A mixture of facility location (coverage) and graph cut (diversity) submodular
+functions naturally captures both.
+
+### Direct application exists
+
+**BumbleBee** (Rao et al., COLM 2024) formulates KV cache selection as
+streaming submodular summarization. Key contributions:
+
+1. Uses a **mixture of submodular functions** balancing:
+   - Diversity among keys in embedding space (graph cut / determinantal)
+   - Importance via accumulated attention scores (facility location)
+2. Works in both **offline** (prefill) and **online** (streaming/decoding) modes
+3. Captures both **long-range coarse-grained** and **short-term fine-grained**
+   dependencies
+4. Validated across 13 datasets on LLaMA-7B and 13B, outperforming H2O and
+   SnapKV at comparable compression ratios
+
+### What it suggests concretely
+
+**Replace max-attention scoring with submodular key selection.** The greedy
+submodular algorithm:
+1. Start with S = empty set
+2. For each step: add key j* = argmax_{j ∉ S} f(S ∪ {j}) - f(S)
+3. The (1-1/e) guarantee holds for any monotone submodular f
+
+**Streaming variant for online compaction.** BumbleBee's online mode maintains
+a summary as tokens arrive — directly applicable to the paper's "online
+compaction during generation" use case (Section 7 of the paper).
+
+**The connection to DPPs (Section 4):** the log-determinant of a DPP kernel is
+submodular, so DPP-based key selection is a special case of submodular
+optimization with the specific diversity kernel being the key similarity matrix.
+
+### Papers
+- [BumbleBee: Dynamic KV-Cache Streaming Submodular Summarization](https://openreview.net/forum?id=8w0RApM5yG) (COLM 2024)
+- Nemhauser, Wolsey, Fisher, "Analysis of Approximations for Maximizing Submodular Set Functions" (Math. Programming 1978)
+- [Streaming Submodular Optimization](https://arxiv.org/abs/1612.02712) (NeurIPS 2016)
+
+---
+
+## 22. Carathéodory's Theorem
+
+**Maps to: theoretical minimum for compacted cache size**
+
+### What it is
+
+**Carathéodory's theorem (1907):** If a point x lies in the convex hull of a
+set S in R^d, then x can be expressed as a convex combination of at most
+**d + 1** points from S.
+
+### The structural analogy
+
+The attention output for a query q is:
+
+```
+Attn(q) = Σ_i w_i · v_i
+```
+
+where w_i are softmax weights (non-negative, sum to 1) and v_i ∈ R^{d_v}.
+This is a **convex combination** of value vectors.
+
+By Carathéodory's theorem, this can be exactly represented using at most
+**d_v + 1** value vectors with recomputed weights, regardless of T.
+
+### What it suggests concretely
+
+**Hard theoretical floor: t_min = d_v + 1 per head.** For typical d_v = 64
+or 128, this means ~65-129 entries per head suffice to exactly reproduce any
+single query's attention output. This gives a fundamental compression limit
+that the current pipeline lacks.
+
+**Carathéodory recombination** is the constructive algorithm: iteratively find
+linear dependencies among value vectors (which must exist when n > d+1), shift
+weight off one vector, eliminate it. Repeat until d+1 remain. Runs in
+O(n · d^2) per elimination step.
+
+**The key limitation:** attention weights are query-dependent. A single static
+Carathéodory reduction preserves the output for one query but not all future
+queries. This is why the compaction pipeline needs reference queries Q_ref —
+to approximate the universal reduction.
+
+**Practical implication for budget allocation:** if a head's effective value
+rank (number of significant singular values of V) is r << d_v, then
+Carathéodory says only r+1 entries are needed. Heads with low-rank value
+matrices can be compressed far more aggressively. This gives a tighter,
+per-head compression floor than the current sensitivity heuristic.
+
+### Papers
+- Carathéodory, "Über den Variabilitätsbereich der Koeffizienten" (Math. Annalen, 1907)
+- [Braverman, Feldman, Lang — "Coreset Constructions"](https://arxiv.org/abs/1612.00889) (2016) — formalizes Carathéodory-based coreset reduction
+- [Feldman, "Core-Sets: An Updated Survey"](https://arxiv.org/abs/2011.09384) (2020)
+
+---
+
+## 23. Information Bottleneck
+
+**Maps to: [D] Budget Allocation + principled compression-quality tradeoff**
+
+### What it is
+
+The Information Bottleneck (Tishby et al., 1999) finds a compressed
+representation T of input X that retains maximum information about a relevant
+target Y. The objective:
+
+```
+minimize  I(X; T) - β · I(T; Y)
+```
+
+where β controls the compression-quality tradeoff. The rate-distortion curve
+R(D) from Section 8 is the Lagrangian dual of this formulation.
+
+### The structural analogy
+
+For KV cache compaction:
+- **X** = full KV cache (all T tokens' keys and values)
+- **T** = compacted cache (t entries with beta and C_v)
+- **Y** = model's next-token prediction quality
+
+The compacted cache should be a lossy compression of the full cache that
+preserves maximum information about generating correct outputs. The IB
+Lagrangian formalizes this: tokens carrying high mutual information with the
+output should be retained; tokens carrying redundant or irrelevant information
+should be compressed away.
+
+### What it suggests concretely
+
+**IB-optimal eviction policy.** Attention weights serve as a proxy for mutual
+information: tokens receiving consistently high attention across heads and
+layers carry more information about future predictions. The IB framework
+formalizes *why* attention-based scoring works and suggests improvements:
+
+1. **Cross-layer information flow.** A token may have low attention at layer L
+   but high information content for layer L+5 (because it feeds through
+   residual connections). IB says the eviction decision should account for
+   information flow through all subsequent layers, not just current attention.
+
+2. **β as a principled compression dial.** Instead of setting a fixed budget t,
+   set a target IB loss β and let the optimal t emerge from the tradeoff curve.
+   Different contexts have different information densities — medical records
+   need more budget than conversational text.
+
+3. **Connection to variational inference.** The IB objective can be optimized
+   via variational bounds (the "Deep Variational Information Bottleneck" of
+   Alemi et al., 2016). This connects to the sparse GP framework (Section 19)
+   — both use variational lower bounds on information-theoretic objectives.
+
+### Papers
+- [Tishby et al., "The Information Bottleneck Method"](https://arxiv.org/abs/physics/0004057) (1999)
+- [Shwartz-Ziv & Tishby, "Opening the Black Box of DNNs via Information"](https://arxiv.org/abs/1703.00810) (2017)
+- [Ge et al., "Model Tells You What to Discard: Adaptive KV Cache Compression"](https://arxiv.org/abs/2310.01801) (ICLR 2024) — applies IB intuition to KV cache
+- Alemi et al., "Deep Variational Information Bottleneck" (ICLR 2017)
+
+---
+
+## 24. Fast Multipole Method & Hierarchical Attention (MuSe)
+
+**Maps to: [A] Key Selection — multi-resolution alternative**
+
+### What it is
+
+The Fast Multipole Method (Greengard & Rokhlin, 1987) computes N-body
+interactions in O(N) by organizing points hierarchically:
+- **Nearby** interactions: computed at full resolution
+- **Distant** interactions: approximated by compact "multipole" summaries
+  (total mass, dipole direction, etc.)
+
+The key insight: **full pairwise detail is unnecessary for distant interactions
+— a compact summary suffices.**
+
+### The structural analogy
+
+KV cache compaction is an N-body problem where "force" = attention weight:
+
+| FMM Concept | KV Cache Analogy |
+|---|---|
+| Nearby particles (full resolution) | Recent/high-attention KV pairs at full fidelity |
+| Distant particles (multipole summary) | Old/low-attention KV pairs as compressed summaries |
+| Multipole expansion (monopole + dipole) | Cluster centroid + covariance correction |
+| Hierarchical tree levels | Multiple resolution tiers of cached KV pairs |
+| Adaptive refinement | Dynamic eviction/merging based on attention scores |
+
+### Direct application exists
+
+**MuSe** (Multipole Semantic Attention, arXiv:2509.10406, 2025) extends
+multipole ideas into representation space:
+
+1. **Semantic clustering:** keys and queries are clustered in representation
+   space (not positional space), yielding query-specific key summaries
+2. **Dipole corrections:** beyond centroid (monopole) representations, adds
+   covariance-based dipole terms capturing directional variance within
+   clusters — reduces approximation error
+3. **Drop-in compatible** with pretrained models (validated on Llama 3.1-8B
+   without retraining). Accelerates 64k-context pretraining by 36% while
+   matching baseline loss.
+
+### What it suggests concretely
+
+**Multi-resolution compaction.** Instead of a single flat compacted cache,
+maintain a hierarchy:
+- **Tier 1** (full resolution): last N tokens, always kept
+- **Tier 2** (moderate compression): keys compressed 4x via merging
+- **Tier 3** (aggressive compression): keys compressed 16x via centroids
+
+As tokens age, they cascade down tiers. This naturally matches the attention
+decay pattern: recent tokens get high attention (need full resolution), distant
+tokens get low attention (coarse summary suffices).
+
+**The dipole correction idea applies directly to value fitting.** When merging
+t_cluster keys into a centroid, store not just the centroid but also its
+principal direction of variance. This captures within-cluster structure that
+simple averaging misses, at minimal memory cost (1 extra vector per cluster).
+
+### Papers
+- [MuSe: Multipole Semantic Attention](https://arxiv.org/abs/2509.10406) (2025)
+- [Fast Multipole Attention for Transformers](https://arxiv.org/abs/2310.11960) (2023)
+- [HERMES: KV Cache as Hierarchical Memory](https://arxiv.org/abs/2601.14724) (2025)
+- Greengard & Rokhlin, "A Fast Algorithm for Particle Simulations" (J. Comp. Physics 1987)
+
+---
+
 ## Summary: Concept-to-Component Map
 
 | Concept | Key Select [A] | Bias [B] | Value [C] | Budget [D] | New idea? |
@@ -934,6 +1284,12 @@ iteration) while providing stronger theoretical guarantees.
 | K-means clustering | x | | x | | Centroid keys (lift C_k ⊆ K) |
 | EM algorithm | x | x | x | | Soft assignment framework |
 | **WildCat / RPCholesky** | **x** | **x** | **x** | | **Unified framework with provable bounds** |
+| Sparse GP / Inducing pts | x | x | x | | Variational objective for joint optimization |
+| Token Merging (ToMe) | x | | x | | Merge-based compaction preserves info |
+| Submodular (BumbleBee) | x | | | x | (1-1/e) guarantee + streaming mode |
+| Carathéodory's theorem | | | | | Theoretical floor: t_min = d_v + 1 |
+| Information Bottleneck | | | | x | Principled compression-quality tradeoff |
+| Fast Multipole / MuSe | x | | | | Multi-resolution hierarchical caching |
 
 ### The Grand Unification
 
@@ -948,16 +1304,24 @@ optimality theory. The researchers independently reinvented these structures.
 Connecting to the established theory unlocks provable bounds, faster
 algorithms, and principled design choices.
 
-### Top 5 Most Actionable (effort vs. impact)
+### Top 7 Most Actionable (effort vs. impact)
 
 1. **RPCholesky key selection** (Sec 18) — adaptive, diversity-aware,
    provable error bounds, no Q_ref needed. Replaces both key selection AND
    NNLS in a unified framework. **The single most impactful change.**
 2. **Alternating minimization** (Sec 10) — loop existing Steps 2+3. Zero new
    code, just a for loop. Cheapest quality improvement to implement.
-3. **DPP / greedy determinantal selection** (Sec 4) — add diversity to key
-   selection without OMP's full cost. (1-1/e) approximation guarantee.
-4. **Sinkhorn for mass matching** (Sec 6) — drop-in NNLS replacement with
+3. **Submodular key selection** (Sec 21) — BumbleBee's mixture of facility
+   location + diversity gives (1-1/e) guarantee with streaming online mode.
+   Directly applicable to the paper's online compaction use case.
+4. **Token merging** (Sec 20) — merge similar keys instead of evicting.
+   Preserves information, degrades gracefully at high compression, lifts
+   C_k ⊆ K constraint. Hybrid with eviction (D2O) is most promising.
+5. **Sinkhorn for mass matching** (Sec 6) — drop-in NNLS replacement with
    automatic non-negativity and theoretical OT connection.
-5. **K-means centroid keys** (Sec 16) — lifts the C_k ⊆ K restriction at
+6. **K-means centroid keys** (Sec 16) — lifts the C_k ⊆ K restriction at
    low cost. Empirically outperforms leverage scores (84% vs 77% on ViT).
+7. **Carathéodory-informed budgets** (Sec 22) — compute per-head value rank
+   to determine theoretical compression floor (t_min = rank(V) + 1). Heads
+   with low-rank values can be compressed far more aggressively than the
+   current sensitivity heuristic suggests.
