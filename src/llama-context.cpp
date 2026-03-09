@@ -1052,6 +1052,31 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_attn_bias(int32_t layer, const float * bias, int32_t n_kv, int32_t n_head_kv) {
+    auto & ab = attn_bias;
+    if (ab.empty()) {
+        // Initialize for all layers
+        ab.resize(model.hparams.n_layer);
+    }
+    if (layer < 0 || layer >= (int32_t) ab.size()) {
+        LLAMA_LOG_WARN("%s: layer %d out of range [0, %d)\n", __func__, layer, (int32_t) ab.size());
+        return;
+    }
+    ab[layer].assign(bias, bias + (size_t) n_kv * n_head_kv);
+
+    // the mask shape changes when bias is active, so we need to re-reserve
+    sched_need_reserve = true;
+}
+
+void llama_context::clear_attn_bias() {
+    if (attn_bias.empty()) {
+        return;
+    }
+    attn_bias.clear();
+
+    sched_need_reserve = true;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2158,6 +2183,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.attn_bias   =*/ attn_bias.empty() ? nullptr : &attn_bias,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3072,6 +3098,14 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_attn_bias(llama_context * ctx, int32_t layer, const float * bias, int32_t n_kv, int32_t n_head_kv) {
+    ctx->set_attn_bias(layer, bias, n_kv, n_head_kv);
+}
+
+void llama_clear_attn_bias(llama_context * ctx) {
+    ctx->clear_attn_bias();
 }
 
 void llama_synchronize(llama_context * ctx) {

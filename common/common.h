@@ -475,6 +475,8 @@ struct common_params {
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
+    bool kv_compact        = false; // use KV cache compaction instead of simple context shift
+    float kv_compact_ratio = 0.5f;  // fraction of tokens to keep during compaction (0.0-1.0)
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 

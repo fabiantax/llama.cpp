@@ -105,6 +105,9 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    void set_attn_bias(int32_t layer, const float * bias, int32_t n_kv, int32_t n_head_kv);
+    void clear_attn_bias();
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -354,6 +357,11 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Per-layer attention bias for KV cache compaction
+    // Outer vector indexed by layer, inner vector is [n_kv * n_head_kv] floats
+    // Empty outer vector means no bias active
+    std::vector<std::vector<float>> attn_bias;
 
     // perf
     mutable int64_t t_start_us  = 0;

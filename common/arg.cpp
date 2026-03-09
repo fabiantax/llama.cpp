@@ -1318,6 +1318,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_CONTEXT_SHIFT"));
     add_opt(common_arg(
+        {"--compact"},
+        {"--no-compact"},
+        "use KV cache compaction (attention-based) instead of simple context shift (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_compact = value;
+            if (value) {
+                params.ctx_shift = true; // compaction requires context shift to be enabled
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KV_COMPACT"));
+    add_opt(common_arg(
+        {"--compact-ratio"}, "RATIO",
+        string_format("fraction of tokens to keep during KV compaction (default: %.2f)", params.kv_compact_ratio),
+        [](common_params & params, const std::string & value) {
+            params.kv_compact_ratio = std::stof(value);
+            if (params.kv_compact_ratio <= 0.0f || params.kv_compact_ratio >= 1.0f) {
+                throw std::invalid_argument("--compact-ratio must be between 0.0 and 1.0 (exclusive)");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KV_COMPACT_RATIO"));
+    add_opt(common_arg(
         {"--chunks"}, "N",
         string_format("max number of chunks to process (default: %d, -1 = all)", params.n_chunks),
         [](common_params & params, int value) {

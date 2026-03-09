@@ -967,6 +967,21 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // Set per-head attention bias for a specific layer's KQ mask
+    // bias: array of [n_kv * n_head_kv] floats, added to attention scores before softmax
+    // The bias values are added to the KQ mask for the specified layer during attention
+    // This creates per-head attention masks (the base causal mask is expanded and bias added)
+    // Use this for KV cache compaction (attention matching algorithm)
+    LLAMA_API void llama_set_attn_bias(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                   const float   * bias,
+                         int32_t   n_kv,
+                         int32_t   n_head_kv);
+
+    // Clear all attention biases (e.g., after cache operations invalidate them)
+    LLAMA_API void llama_clear_attn_bias(struct llama_context * ctx);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

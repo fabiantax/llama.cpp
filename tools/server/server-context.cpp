@@ -9,6 +9,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "server-kv-compact.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -2003,24 +2004,66 @@ private:
 
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
-                const int n_left    = slot.prompt.n_tokens() - n_keep;
-                const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+                GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
-                SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                if (params_base.kv_compact) {
+                    // KV cache compaction: attention-based token selection
+                    const int n_total = slot.prompt.n_tokens();
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
-                llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+                    SLT_WRN(slot, "slot KV compaction, n_keep = %d, n_total = %d, ratio = %.2f\n",
+                            n_keep, n_total, params_base.kv_compact_ratio);
 
-                // add generated tokens to cache
-                // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
-                {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    kv_compact_result cr = server_kv_compact(
+                            ctx, slot.id, n_keep, n_total, params_base.kv_compact_ratio);
 
-                    llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens(); // copy
+                    if (cr.success) {
+                        // Update token array to match compacted cache
+                        llama_tokens old_tokens = slot.prompt.tokens.get_text_tokens();
+                        llama_tokens new_tokens;
+                        new_tokens.reserve(cr.t);
+                        for (int j = 0; j < cr.t; j++) {
+                            new_tokens.push_back(old_tokens[cr.selected_indices[j]]);
+                        }
+
+                        slot.prompt.tokens.clear();
+                        slot.prompt.tokens.insert(new_tokens);
+
+                        SLT_WRN(slot, "slot KV compaction done, %d → %d tokens (%.1f%%)\n",
+                                n_total, cr.t, 100.0f * cr.t / n_total);
+                    } else {
+                        // Fallback to standard context shift
+                        SLT_WRN(slot, "KV compaction failed, falling back to standard context shift\n", "");
+
+                        const int n_left    = slot.prompt.n_tokens() - n_keep;
+                        const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+
+                        llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                        llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                        llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens();
+                        for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
+                            new_tokens[i - n_discard] = new_tokens[i];
+                        }
+                        new_tokens.resize(slot.prompt.tokens.size() - n_discard);
+
+                        slot.prompt.tokens.clear();
+                        slot.prompt.tokens.insert(new_tokens);
+                    }
+                } else {
+                    // Standard context shift: discard oldest tokens after n_keep
+                    const int n_left    = slot.prompt.n_tokens() - n_keep;
+                    const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+
+                    SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+
+                    llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
+                    llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens();
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
                         new_tokens[i - n_discard] = new_tokens[i];
                     }
-
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
                     slot.prompt.tokens.clear();
