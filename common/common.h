@@ -104,6 +104,7 @@ enum llama_example {
     LLAMA_EXAMPLE_DIFFUSION,
     LLAMA_EXAMPLE_FINETUNE,
     LLAMA_EXAMPLE_FIT_PARAMS,
+    LLAMA_EXAMPLE_RESULTS,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -456,6 +457,8 @@ struct common_params {
 
     bool   kl_divergence    = false; // compute KL divergence
 
+    bool check             = false; // check rather than generate results for llama-results
+
     bool usage             = false; // print usage
     bool completion        = false; // print source-able completion script
     bool use_color         = false; // use color to distinguish generations and inputs
@@ -472,6 +475,8 @@ struct common_params {
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
+    bool kv_compact        = false; // use KV cache compaction instead of simple context shift
+    float kv_compact_ratio = 0.5f;  // fraction of tokens to keep during compaction (0.0-1.0)
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
@@ -516,14 +521,15 @@ struct common_params {
     std::string cls_sep    = "\t";  // separator of classification sequences
 
     // server params
-    int32_t port              = 8080;         // server listens on this network port
-    int32_t timeout_read      = 600;          // http read timeout in seconds
-    int32_t timeout_write     = timeout_read; // http write timeout in seconds
-    int32_t n_threads_http    = -1;           // number of threads to process HTTP requests (TODO: support threadpool)
-    int32_t n_cache_reuse     = 0;            // min chunk size to reuse from the cache via KV shifting
-    bool    cache_prompt      = true;         // whether to enable prompt caching
-    int32_t n_ctx_checkpoints = 8;            // max number of context checkpoints per slot
-    int32_t cache_ram_mib     = 8192;         // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t port                = 8080;          // server listens on this network port
+    int32_t timeout_read        = 600;           // http read timeout in seconds
+    int32_t timeout_write       = timeout_read;  // http write timeout in seconds
+    int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
+    int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
+    bool    cache_prompt        = true;  // whether to enable prompt caching
+    int32_t n_ctx_checkpoints   = 32;     // max number of context checkpoints per slot
+    int32_t checkpoint_every_nt = 8192;   // make a checkpoint every n tokens during prefill
+    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -545,6 +551,7 @@ struct common_params {
 
     // webui configs
     bool webui = true;
+    bool webui_mcp_proxy = false;
     std::string webui_config_json;
 
     // "advanced" endpoints are disabled by default for better security
@@ -774,6 +781,11 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    // UMA bandwidth-aware profiler (APEX-inspired). Returns empty string if not active.
+    std::string uma_profiler_get_report();
+    // Signal that a forward pass completed (for UMA profiler iteration tracking).
+    void uma_profiler_on_iteration();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -869,7 +881,7 @@ std::string common_detokenize(
 // Embedding utils
 //
 
-// TODO: repace embd_norm with an enum
+// TODO: replace embd_norm with an enum
 void common_embd_normalize(const float * inp, float * out, int n, int embd_norm);
 
 float common_embd_similarity_cos(const float * embd1, const float * embd2, int n);

@@ -308,6 +308,12 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // per-layer attention bias tensors for KV cache compaction
+    // F32 [n_kv, 1, n_head_kv, 1] - added to the KQ mask per layer during attention
+    // indexed by model layer id; empty vector when no bias is active
+    std::vector<ggml_tensor *> self_kq_bias;
+    std::vector<ggml_tensor *> self_kq_bias_cnv; // converted to F16 for flash attention
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -315,6 +321,17 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+
+    // per-layer attention bias for KV cache compaction (nullptr when inactive)
+    const std::vector<std::vector<float>> * attn_bias = nullptr;
+
+    // get the bias tensor for a given layer (nullptr if no bias for that layer)
+    ggml_tensor * get_kq_bias(int il) const {
+        if (il < 0 || il >= (int) self_kq_bias_cnv.size()) {
+            return nullptr;
+        }
+        return self_kq_bias_cnv[il];
+    }
 };
 
 // V-less input for the KV cache
@@ -344,10 +361,25 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // per-layer attention bias tensors for KV cache compaction
+    std::vector<ggml_tensor *> self_kq_bias;
+    std::vector<ggml_tensor *> self_kq_bias_cnv;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+
+    // per-layer attention bias for KV cache compaction (nullptr when inactive)
+    const std::vector<std::vector<float>> * attn_bias = nullptr;
+
+    // get the bias tensor for a given layer (nullptr if no bias for that layer)
+    ggml_tensor * get_kq_bias(int il) const {
+        if (il < 0 || il >= (int) self_kq_bias_cnv.size()) {
+            return nullptr;
+        }
+        return self_kq_bias_cnv[il];
+    }
 };
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
@@ -534,6 +566,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // per-layer attention bias for KV cache compaction
+    // pointer to context's attn_bias vector; nullptr when no bias is active
+    const std::vector<std::vector<float>> * attn_bias;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -610,6 +646,13 @@ struct llm_graph_params {
                     return false;
                 }
             }
+        }
+
+        // attn_bias changes graph topology (adds repeat+add nodes per layer)
+        const bool this_has_bias  = (attn_bias != nullptr && !attn_bias->empty());
+        const bool other_has_bias = (other.attn_bias != nullptr && !other.attn_bias->empty());
+        if (this_has_bias != other_has_bias) {
+            return false;
         }
 
         return
@@ -742,6 +785,9 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // per-layer attention bias for KV cache compaction (nullptr when inactive)
+    const std::vector<std::vector<float>> * attn_bias;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -810,7 +856,6 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
          llm_ffn_op_type   type_op,
                     bool   norm_w,
-                    bool   scale_w,
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,
@@ -832,7 +877,6 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
          llm_ffn_op_type   type_op,
                     bool   norm_w,
-                    bool   scale_w,
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,

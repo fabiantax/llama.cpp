@@ -429,12 +429,31 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    // set per-layer attention bias tensors
+    if (attn_bias != nullptr && !attn_bias->empty()) {
+        const auto & bias_vec = *attn_bias;
+        for (size_t il = 0; il < bias_vec.size() && il < self_kq_bias.size(); ++il) {
+            if (self_kq_bias[il] && !bias_vec[il].empty()) {
+                const size_t bias_bytes = bias_vec[il].size() * sizeof(float);
+                const size_t tensor_bytes = ggml_nbytes(self_kq_bias[il]);
+                if (bias_bytes == tensor_bytes) {
+                    ggml_backend_tensor_set(self_kq_bias[il], bias_vec[il].data(), 0, bias_bytes);
+                }
+            }
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
+    // check attn_bias state change before updating
+    const bool had_bias = (this->attn_bias != nullptr && !this->attn_bias->empty());
+    const bool has_bias = (params.attn_bias != nullptr && !params.attn_bias->empty());
+
     this->mctx = mctx;
+    this->attn_bias = params.attn_bias;
 
     bool res = true;
 
@@ -443,6 +462,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
+    // cannot reuse if attn_bias state changed (graph topology differs)
+    res &= (had_bias == has_bias);
+
     return res;
 }
 
@@ -450,18 +472,40 @@ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    // set per-layer attention bias tensors
+    if (attn_bias != nullptr && !attn_bias->empty()) {
+        const auto & bias_vec = *attn_bias;
+        for (size_t il = 0; il < bias_vec.size() && il < self_kq_bias.size(); ++il) {
+            if (self_kq_bias[il] && !bias_vec[il].empty()) {
+                const size_t bias_bytes = bias_vec[il].size() * sizeof(float);
+                const size_t tensor_bytes = ggml_nbytes(self_kq_bias[il]);
+                if (bias_bytes == tensor_bytes) {
+                    ggml_backend_tensor_set(self_kq_bias[il], bias_vec[il].data(), 0, bias_bytes);
+                }
+            }
+        }
+    }
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
+    // check attn_bias state change before updating
+    const bool had_bias = (this->attn_bias != nullptr && !this->attn_bias->empty());
+    const bool has_bias = (params.attn_bias != nullptr && !params.attn_bias->empty());
+
     this->mctx = mctx;
+    this->attn_bias = params.attn_bias;
 
     bool res = true;
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // cannot reuse if attn_bias state changed (graph topology differs)
+    res &= (had_bias == has_bias);
 
     return res;
 }
@@ -509,6 +553,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     float * data = (float *) cross_kq_mask->data;
 
     for (int i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT(!cross->seq_ids_enc.empty() && "llama_encode must be called first");
         for (int j = 0; j < n_enc; ++j) {
             float f = -INFINITY;
 
@@ -877,6 +922,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    attn_bias        (params.attn_bias),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1161,7 +1207,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
              int64_t   n_expert_used,
      llm_ffn_op_type   type_op,
                 bool   norm_w,
-                bool   scale_w,
                float   w_scale,
          llama_expert_gating_func_type gating_op,
                  int   il,
@@ -1178,7 +1223,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         n_expert_used,
         type_op,
         norm_w,
-        scale_w,
         w_scale,
         gating_op,
         il,
@@ -1202,7 +1246,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
              int64_t   n_expert_used,
      llm_ffn_op_type   type_op,
                 bool   norm_w,
-                bool   scale_w,
                float   w_scale,
         llama_expert_gating_func_type gating_op,
                  int   il,
@@ -1330,7 +1373,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
-    if (scale_w) {
+    if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
@@ -1607,6 +1650,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     // this need to be 1x1xN for broadcasting
     cur = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
     ggml_set_input(cur);
+    ggml_set_name(cur, "attn_scale");
 
     res->add_input(std::move(inp));
 
@@ -1616,7 +1660,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interere with
-    //       features that require constant topology such as pipline parallelism
+    //       features that require constant topology such as pipeline parallelism
     //       ref: https://github.com/ggml-org/llama.cpp/pull/14275#issuecomment-2987424471
     //if (n_outputs < n_tokens) {
     //    return nullptr;
@@ -1779,7 +1823,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
-            // However, the code is optimized for dimensions 0 and 1 being large, so this is ineffient.
+            // However, the code is optimized for dimensions 0 and 1 being large, so this is inefficient.
             cur = ggml_reshape_4d(ctx0, cur, v_mla->ne[0], 1, n_head, n_tokens);
             cur = ggml_mul_mat(ctx0, v_mla, cur);
 #else
@@ -1942,7 +1986,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const std::vector<std::vector<float>> * attn_bias = nullptr) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -1959,13 +2004,40 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }
 
+    // store the attn_bias pointer on the input for per-layer bias tensor creation
+    inp->attn_bias = attn_bias;
+
+    // create per-layer bias input tensors when attn_bias is active
+    if (attn_bias != nullptr && !attn_bias->empty()) {
+        const auto & bias_vec = *attn_bias;
+        const int64_t n_layers = (int64_t) bias_vec.size();
+        const int64_t n_kv = mctx_cur->get_n_kv();
+        const uint32_t n_hkv = hparams.n_head_kv();
+
+        inp->self_kq_bias.resize(n_layers, nullptr);
+        inp->self_kq_bias_cnv.resize(n_layers, nullptr);
+
+        for (int64_t il = 0; il < n_layers; ++il) {
+            if (bias_vec[il].empty()) {
+                continue;
+            }
+            // bias shape: [n_kv, 1, n_head_kv, 1]
+            // this broadcasts over n_tokens and n_stream when added to the expanded mask
+            auto * bias_t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, n_hkv, 1);
+            ggml_set_input(bias_t);
+
+            inp->self_kq_bias[il] = bias_t;
+            inp->self_kq_bias_cnv[il] = cparams.flash_attn ? ggml_cast(ctx0, bias_t, GGML_TYPE_F16) : bias_t;
+        }
+    }
+
     return inp;
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, attn_bias);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -2002,7 +2074,16 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    // apply per-layer attention bias if active for this layer
+    ggml_tensor * kq_bias = inp->get_kq_bias(il);
+    if (kq_bias) {
+        // expand mask from [n_kv, n_tps, 1, n_stream] to [n_kv, n_tps, n_head_kv, n_stream]
+        // then add bias [n_kv, 1, n_head_kv, 1] which broadcasts over n_tps and n_stream
+        kq_mask = ggml_repeat_4d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1], kq_bias->ne[2], kq_mask->ne[3]);
+        kq_mask = ggml_add(ctx0, kq_mask, kq_bias);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -2031,7 +2112,8 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const std::vector<std::vector<float>> * attn_bias = nullptr) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
 
@@ -2046,13 +2128,37 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }
 
+    inp->attn_bias = attn_bias;
+
+    // create per-layer bias input tensors when attn_bias is active
+    if (attn_bias != nullptr && !attn_bias->empty()) {
+        const auto & bias_vec = *attn_bias;
+        const int64_t n_layers = (int64_t) bias_vec.size();
+        const int64_t n_kv = mctx_cur->get_n_kv();
+        const uint32_t n_hkv = hparams.n_head_kv();
+
+        inp->self_kq_bias.resize(n_layers, nullptr);
+        inp->self_kq_bias_cnv.resize(n_layers, nullptr);
+
+        for (int64_t il = 0; il < n_layers; ++il) {
+            if (bias_vec[il].empty()) {
+                continue;
+            }
+            auto * bias_t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, n_hkv, 1);
+            ggml_set_input(bias_t);
+
+            inp->self_kq_bias[il] = bias_t;
+            inp->self_kq_bias_cnv[il] = cparams.flash_attn ? ggml_cast(ctx0, bias_t, GGML_TYPE_F16) : bias_t;
+        }
+    }
+
     return inp;
 }
 
 llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur, attn_bias);
 
     return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
 }
@@ -2085,7 +2191,14 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    // apply per-layer attention bias if active for this layer
+    ggml_tensor * kq_bias = inp->get_kq_bias(il);
+    if (kq_bias) {
+        kq_mask = ggml_repeat_4d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1], kq_bias->ne[2], kq_mask->ne[3]);
+        kq_mask = ggml_add(ctx0, kq_mask, kq_bias);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
