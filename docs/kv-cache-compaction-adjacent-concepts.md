@@ -124,7 +124,7 @@ The current method has no such guarantee.
 ### Papers
 - [Improved Coresets for Kernel Density Estimates](https://dl.acm.org/doi/abs/10.5555/3174304.3175477) (SODA 2018) — O(1/eps^2) coreset size, dimension-independent
 - Feldman & Langberg, "A Unified Framework for Approximating and Clustering Data" (STOC 2011)
-- Braverman et al., "New Frameworks for Offline and Streaming Coreset Constructions" (2016)
+- [Efficient Coreset Constructions via Sensitivity Sampling](https://proceedings.mlr.press/v157/braverman21a.html) (ACML 2021)
 
 ---
 
@@ -166,7 +166,12 @@ aggressive compression is possible. This suggests a *diagnostic*: compute the
 top-k eigenvalues of the attention matrix to predict achievable compression
 before attempting it.
 
+**Nystromformer** (Xiong et al., AAAI 2021) made this connection explicit for
+transformers, applying the Nyström formula directly to the softmax kernel
+matrix with strided average pooling for landmark selection.
+
 ### Papers
+- [Nystromformer: A Nyström-Based Algorithm for Approximating Self-Attention](https://arxiv.org/abs/2102.03902) (AAAI 2021)
 - Williams & Seeger, "Using the Nyström Method to Speed Up Kernel Machines" (NeurIPS 2001)
 - [Improving CUR and Nyström Using QR](https://www.jmlr.org/papers/volume14/wang13c/wang13c.pdf) (JMLR 2013)
 - Kumar et al., "Sampling Methods for the Nyström Method" (JMLR 2012)
@@ -773,6 +778,88 @@ most of the benefit of soft assignment with minimal implementation cost.
 
 ---
 
+## 18. WildCat & Randomly Pivoted Cholesky (RPCholesky)
+
+**Maps to: [A]+[B]+[C] — the unified framework that ties everything together**
+
+### What it is
+
+**WildCat** (Feb 2025, arXiv:2602.10056) explicitly treats attention as a
+kernel matrix and applies Nyström approximation with RPCholesky landmark
+selection. RPCholesky is an adaptive column selection algorithm that samples
+pivots proportional to the *residual diagonal* of the kernel matrix:
+
+```
+For r = 1, 2, ..., t:
+    p_j^r = h_residual(k_j, k_j) / sum_l h_residual(k_l, k_l)
+    sample pivot j* ~ p^r
+    update residual via rank-one deflation
+```
+
+This is an *adaptive leverage score* method — the residual diagonal entries
+serve as proxies for current leverage scores, updated after each selection.
+Total cost: O(T * t^2) — same as greedy DPP but simpler.
+
+### Why this is the most important discovery in this document
+
+WildCat **unifies** coresets, Nyström, and KV cache compression into a single
+framework with *provable super-polynomial error decay*:
+
+```
+||output - output_approx||_max <= 3 * ||V||_max * T^{-a}
+```
+
+where a is controlled by the coreset size t. The error decays faster than any
+polynomial in T — meaning moderate increases in t give dramatic quality gains.
+
+**The three-way equivalence:**
+
+| Coreset view | Nyström view | KV cache view |
+|-------------|-------------|---------------|
+| Sensitivity sampling | Landmark selection | Key selection (Step 1) |
+| Coreset weights 1/(|S|*p_i) | Pseudoinverse K_{mm}^{-1} K_{mn} | NNLS bias (Step 2) |
+| Weighted function eval | Nyström reconstruction | Attention output (Step 3) |
+
+The KV compaction pipeline independently reinvented this structure. Connecting
+to the established theory gives access to:
+- **Provable error bounds** (the current pipeline has none)
+- **Adaptive selection** (RPCholesky adapts based on what's already selected)
+- **Optimal weights** via pseudoinverse (vs. the 200-iteration NNLS)
+
+### What it suggests concretely
+
+**Replace max-attention key scoring with RPCholesky.** Instead of scoring all
+keys independently then taking top-t, adaptively select keys one at a time,
+updating the residual after each. Keys that are redundant with already-
+selected keys will have small residual diagonal entries and won't be selected.
+This captures diversity automatically.
+
+**Replace NNLS with pseudoinverse weights.** The Nyström formula
+W = K_{mm}^{-1} K_{mn} gives optimal unconstrained weights in O(t^2 * T)
+time. If non-negativity is needed, project the result or use the
+Caratheodory-based recombination that guarantees positive weights.
+
+**The RPCholesky algorithm is simpler than OMP** (no NNLS sub-solve per
+iteration) while providing stronger theoretical guarantees.
+
+### Comparison to current pipeline
+
+| Property | Current (HighestAttn) | RPCholesky/WildCat |
+|----------|---------------------|-------------------|
+| Diversity-aware | No | Yes (adaptive) |
+| Error guarantee | None | Super-polynomial decay |
+| Needs Q_ref | Yes (repeat-prefill) | No (kernel diagonal only) |
+| Complexity | O(T * n_q * d_k) | O(T * t^2) |
+| Weight computation | NNLS (200 iters) | Pseudoinverse (closed-form) |
+
+### Papers
+- [WildCat: Near-Linear Attention in Theory and Practice](https://arxiv.org/abs/2602.10056) (Feb 2025)
+- [Randomly Pivoted Cholesky](https://arxiv.org/abs/2207.06503) (Chen, Epperly, Tropp, Webber, 2023)
+- [Accelerated RPCholesky](https://arxiv.org/abs/2410.03969) (2024) — 40x speedup via block computation
+- [Adaptive Randomized Pivoting for CSSP](https://doi.org/10.1137/24M1719189) (SIAM 2024)
+
+---
+
 ## Summary: Concept-to-Component Map
 
 | Concept | Key Select [A] | Bias [B] | Value [C] | Budget [D] | New idea? |
@@ -794,16 +881,18 @@ most of the benefit of soft assignment with minimal implementation cost.
 | Compressed sensing | | x | | | Sparse beta via L1 |
 | K-means clustering | x | | x | | Centroid keys (lift C_k ⊆ K) |
 | EM algorithm | x | x | x | | Soft assignment framework |
+| **WildCat / RPCholesky** | **x** | **x** | **x** | | **Unified framework with provable bounds** |
 
 ### Top 5 Most Actionable (effort vs. impact)
 
-1. **Alternating minimization** (Sec 10) — loop existing Steps 2+3. Zero new
-   code, just a for loop. Likely the cheapest quality improvement.
-2. **Leverage score key selection** (Sec 5) — O(Td) computation, no Q_ref
-   needed. Could eliminate the repeat-prefill cost entirely.
+1. **RPCholesky key selection** (Sec 18) — adaptive, diversity-aware,
+   provable error bounds, no Q_ref needed. Replaces both key selection AND
+   NNLS in a unified framework. **The single most impactful change.**
+2. **Alternating minimization** (Sec 10) — loop existing Steps 2+3. Zero new
+   code, just a for loop. Cheapest quality improvement to implement.
 3. **DPP / greedy determinantal selection** (Sec 4) — add diversity to key
-   selection without OMP's full cost.
+   selection without OMP's full cost. (1-1/e) approximation guarantee.
 4. **Sinkhorn for mass matching** (Sec 6) — drop-in NNLS replacement with
-   automatic non-negativity.
+   automatic non-negativity and theoretical OT connection.
 5. **K-means centroid keys** (Sec 16) — lifts the C_k ⊆ K restriction at
-   low cost. The researchers identified this restriction as a key limitation.
+   low cost. Empirically outperforms leverage scores (84% vs 77% on ViT).
