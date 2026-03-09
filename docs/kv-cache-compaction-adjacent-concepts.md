@@ -466,10 +466,26 @@ and fits values in a single optimization loop. Each iteration:
 **Convergence:** O(1/t) rate for smooth objectives, with the sparsity of the
 solution directly matching the budget constraint.
 
+### Deep theoretical connection: attention IS Frank-Wolfe
+
+A remarkable 2025 paper ("Attention's Forward Pass and Frank-Wolfe,"
+arXiv:2508.09628) proves that in the hardmax (zero-temperature) limit,
+**the self-attention update rule IS a Frank-Wolfe step** over the convex hull
+of token embeddings. Key results:
+- With positive semidefinite key-query matrix, the dynamics induce a Voronoi
+  diagram over tokens, with super-exponential convergence to vertices.
+- This provides geometric justification for why attention naturally
+  concentrates on ~1-2% of keys — the same observation that makes KV cache
+  compaction possible.
+
+This means FW-style greedy selection isn't just a useful algorithm — it's
+*aligned with the attention mechanism's own dynamics*.
+
 ### Papers
+- [Attention's Forward Pass and Frank-Wolfe](https://arxiv.org/abs/2508.09628) (2025)
 - Frank & Wolfe, "An Algorithm for Quadratic Programming" (1956)
 - Jaggi, "Revisiting Frank-Wolfe" (ICML 2013)
-- Clarkson, "Coresets, Sparse Greedy Approximation, and the Frank-Wolfe Algorithm" (2010)
+- [Clarkson, "Coresets, Sparse Greedy Approximation, and Frank-Wolfe"](https://kenclarkson.org/sga/p.pdf) (2010)
 
 ---
 
@@ -627,9 +643,20 @@ incompatible with the current beta framework (which assumes C_k ⊆ K).
 doesn't matter) while keeping subset selection for keys (where the softmax
 structure requires real key vectors).
 
+**Critical challenge:** sketching K into B_K means the softmax applies to
+Q @ B_K^T rather than Q @ K^T. The covariance guarantee (B^T B ≈ A^T A) does
+not transfer through the softmax nonlinearity. This is why subset selection
+dominates for keys, but sketching may work for values.
+
+**Already deployed variant:** PALU (ICLR 2025) decomposes K/V projection
+weight matrices via SVD into y = xAB, caches only the compressed intermediate
+xA, and reconstructs on the fly. Achieves 91%+ compression — but requires
+model-specific decomposition rather than post-hoc compaction.
+
 ### Papers
 - Liberty, "Simple and Deterministic Matrix Sketching" (KDD 2013)
 - Ghashami et al., "Frequent Directions: Simple and Deterministic Matrix Sketching" (SIAM 2016)
+- [PALU: KV-Cache Compression with Low-Rank Projection](https://arxiv.org/abs/2407.21118) (ICLR 2025)
 
 ---
 
@@ -659,19 +686,32 @@ current layer, propagate the compacted output through subsequent layers and
 minimize final output divergence. This is more expensive but directly
 optimizes what we care about.
 
-**CKA as a diagnostic:** compute CKA between the original and compacted
-attention outputs. If CKA is high even when MSE is moderate, the compaction
-preserves the *structure* of the representation (what matters), not just the
-exact values.
+**CKA as a fitting objective.** Instead of minimizing ||X @ C_v - Y||_F,
+minimize a CKA-based loss that matches the *relational structure* of
+attention outputs rather than pointwise values. Saha et al. (BMVC 2022)
+showed "it is better to teach students the shape of the similarity
+distribution rather than raw values." Recent work (IJCAI 2024) proves
+maximizing CKA is equivalent to minimizing an upper bound on MMD — linking
+back to kernel herding (Section 7).
 
 **Layer-wise importance weighting:** distillation research shows some layers
 are more important to match than others. Apply more aggressive compression
 to layers where errors don't propagate, less to layers where they do.
 
+**Does matching attention output guarantee matching final output?** No —
+errors compound through subsequent layers, bounded by epsilon_l *
+prod_{j=l+1}^{L} ||W_j||. But in practice, spectral norms are close to 1
+and the network has inherent robustness. A 2025 study found that even
+*reverse* layer matching (student layer 1 to teacher layer L) works
+surprisingly well, suggesting intermediate matching is more of a
+regularization effect than strict functional equivalence.
+
 ### Papers
+- [CKA for Knowledge Distillation](https://bmvc2022.mpi-inf.mpg.de/535/) (BMVC 2022)
+- [Rethinking CKA in KD](https://arxiv.org/abs/2401.11824) (IJCAI 2024) — proves CKA ≈ MMD
+- [PALU: KV-Cache Compression with Low-Rank Projection](https://arxiv.org/abs/2407.21118) (ICLR 2025)
 - Romero et al., "FitNets: Hints for Thin Deep Nets" (ICLR 2015)
 - Kornblith et al., "Similarity of Neural Network Representations Revisited" (ICML 2019)
-- Palu (ICLR 2025): already applies layer-wise sensitivity for KV cache via SVD decomposition
 
 ---
 
@@ -706,8 +746,20 @@ many removed keys. This pattern could guide key selection: prefer keys whose
 natural mass is close to what's needed (w ≈ 1) and avoid keys that require
 extreme beta corrections.
 
+**Surprising finding:** NNLS is already near-optimal for this structure.
+Research on non-negative sparse recovery shows NNLS reliably recovers sparse
+non-negative vectors *without* any explicit L1 regularization — the
+non-negativity constraint alone provides implicit sparsity promotion. This
+validates the current approach's choice of NNLS over basis pursuit.
+
+**Direct application:** CS-VLM (2025) explicitly frames attention as
+compressed sensing, projecting K/V into lower dimensions and using sparse
+recovery (ISTA, OMP, or learned LISTA) to reconstruct attention outputs.
+
 ### Papers
 - Candès & Tao, "Near-Optimal Signal Recovery from Random Projections" (IEEE IT 2006)
+- [Perfect Recovery Conditions for Non-Negative Sparse Modeling](https://arxiv.org/pdf/1512.02743) (2015)
+- [CS-VLM: Compressed Sensing Attention](https://arxiv.org/html/2507.02957) (2025)
 - Slawski & Hein, "Non-negative Least Squares for High-Dimensional Linear Models" (2013)
 
 ---
@@ -882,6 +934,19 @@ iteration) while providing stronger theoretical guarantees.
 | K-means clustering | x | | x | | Centroid keys (lift C_k ⊆ K) |
 | EM algorithm | x | x | x | | Soft assignment framework |
 | **WildCat / RPCholesky** | **x** | **x** | **x** | | **Unified framework with provable bounds** |
+
+### The Grand Unification
+
+Three independent results converge on the same conclusion:
+- **Clarkson (2010):** Frank-Wolfe = Matching Pursuit = Coreset construction
+- **Alcalde et al. (2025):** Attention's forward pass IS a Frank-Wolfe step
+- **WildCat (2025):** KV compaction IS Nyström approximation of a kernel matrix
+
+**The compaction pipeline is not an ad-hoc engineering solution.** It is a
+specific instance of well-studied mathematical structures with decades of
+optimality theory. The researchers independently reinvented these structures.
+Connecting to the established theory unlocks provable bounds, faster
+algorithms, and principled design choices.
 
 ### Top 5 Most Actionable (effort vs. impact)
 
