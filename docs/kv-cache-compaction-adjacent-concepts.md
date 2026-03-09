@@ -60,8 +60,20 @@ guarantee output preservation*, but CUR-based selection minimizes end-to-end
 reconstruction loss. Achieves up to 9.6% higher accuracy than SnapKV and
 ChunkKV under aggressive compression.
 
+### Surprising empirical finding
+
+LevAttention (Kannan et al., 2024) computes leverage scores of the key
+matrix in O(nd) time and selects top-scoring keys. However, a follow-up
+(2025) found that **k-means clustering of keys outperforms leverage score
+selection** (84.46% vs 77.17% accuracy on ViT-Large when selecting 128 of
+197 keys). This suggests geometric structure matters more than algebraic
+importance for pre-trained models — a direct argument for centroid-based
+approaches (Section 16).
+
 ### Papers
 - [CurDKV: Value-Guided KV Compression via CUR Decomposition](https://arxiv.org/abs/2509.15038) (NeurIPS 2025)
+- [LevAttention: Leverage Scores for Attention](https://arxiv.org/abs/2410.05462) (2024)
+- [Efficient Attention via Pre-Scoring](https://arxiv.org/abs/2505.11040) (2025)
 - [Column and Row Subset Selection Using Nuclear Scores](https://arxiv.org/abs/2407.01698) (2024)
 - Voronin & Martinsson, "Efficient algorithms for CUR and interpolative matrix decompositions" (2017)
 
@@ -179,14 +191,23 @@ and *diversity* (don't keep redundant keys). Max-attention scoring gets
 importance but ignores diversity. OMP gets both but is slow.
 
 DPPs naturally balance quality and diversity in a single framework. The DPP
-kernel L can be constructed as:
+kernel L decomposes as:
 
 ```
-L_ij = quality_i * similarity(key_i, key_j) * quality_j
+L_ij = q_i * phi_i^T phi_j * q_j
 ```
 
-where quality = attention importance score and similarity = cosine similarity
-between key vectors.
+where q_i is a scalar "quality" score (attention importance) and phi_i is a
+unit diversity feature vector (normalized key vector). The determinant
+simultaneously rewards high individual quality AND mutual orthogonality.
+**Items with parallel feature vectors are selected together with probability
+zero** — the parallelepiped they span is degenerate. This is exactly the
+diversity property that max-attention scoring lacks.
+
+The log-determinant of the DPP kernel is a *submodular* function, so greedy
+maximization gives a (1 - 1/e) approximation guarantee (Nemhauser-Wolsey-
+Fisher theorem). No such guarantee exists for the current max-attention
+scoring.
 
 ### What it suggests concretely
 
@@ -235,6 +256,12 @@ alone (via a randomized SVD), without computing the full attention matrix.
 This is cheaper than the current approach which requires the full Q_ref @ K^T
 product.
 
+The leverage score of column j is l_j = ||V_k^T e_j||^2 — the squared norm
+of the j-th row of the top-k right singular vectors. This measures how much
+column j contributes to the dominant subspace. Approximate leverage scores
+can be computed in O(nnz(K) * log T + poly(t)) time using CountSketch or
+SRHT random projections.
+
 The approximation guarantee: with O(t * log(t) / eps^2) columns sampled by
 leverage scores, the reconstruction error is within (1 + eps) of the best
 rank-t approximation. This is an *existential guarantee* — the current
@@ -244,6 +271,11 @@ pipeline has none.
 sampling. If the result is worse (because leverage scores don't account for
 the softmax nonlinearity), use a hybrid: pre-filter by leverage scores, then
 re-rank by attention.
+
+**Existing application:** LevAttention (2024) already applies this to
+transformer attention — computing key leverage scores in O(nd) and selecting
+top-scoring keys. Achieves >90% accuracy retention on ViT when keeping only
+32 of 197 keys.
 
 ### Papers
 - Drineas et al., "CUR Matrix Decompositions for Improved Data Analysis" (PNAS 2009)
@@ -263,16 +295,19 @@ probability distribution into another. Sinkhorn iterations solve the
 entropy-regularized OT problem via alternating row/column normalization of
 a cost matrix.
 
-### The structural analogy
+### The structural analogy — and a deep theoretical connection
 
-The mass matching problem (Step 2) asks: find weights w such that the
-compacted attention mass matches the original. This is a 1D transport problem:
-redistribute the original mass (distributed across T keys) onto t keys via
-non-negative weights.
+A 2025 paper ("Scaled-Dot-Product Attention as One-Sided Entropic Optimal
+Transport," arXiv:2508.08369) **proves that standard softmax attention IS a
+one-sided entropic OT problem**. It minimizes transport cost (negative
+similarity) from queries to keys with entropy regularization (temperature),
+subject to per-query mass conservation. The unique solution is exactly the
+softmax function.
 
-More precisely, the NNLS problem M @ w ≈ m can be reinterpreted as: find a
-transport plan from the "compressed" distribution to the "full" distribution
-that preserves marginals.
+This means the mass matching problem (Step 2) is literally an optimal
+transport problem: redistribute the original attention mass (distributed
+across T keys) onto t keys via non-negative weights, preserving per-query
+mass marginals.
 
 ### What it suggests concretely
 
@@ -286,7 +321,19 @@ more numerically stable than the current projected gradient approach.
 **Entropic regularization** naturally prevents degenerate solutions (all mass
 on one key), acting as a smoother version of the 1e-12 floor hack.
 
+### Related: doubly-stochastic attention
+
+**Sinkformers** (Sander et al., AISTATS 2022) replace softmax (row-stochastic)
+with Sinkhorn normalization (doubly-stochastic). Key finding: trained
+transformers' attention matrices naturally converge toward doubly-stochastic
+matrices over epochs, suggesting full mass conservation is a natural inductive
+bias. For compaction, this implies the mass-matching step should consider not
+just per-query totals (row sums) but also per-key participation balance
+(column sums).
+
 ### Papers
+- [Attention as One-Sided Entropic OT](https://arxiv.org/pdf/2508.08369) (2025)
+- [Sinkformers: Doubly-Stochastic Attention](https://proceedings.mlr.press/v151/sander22a/sander22a.pdf) (AISTATS 2022)
 - Cuturi, "Sinkhorn Distances: Lightspeed Computation of Optimal Transport" (NeurIPS 2013)
 - [Scalable Approximate Algorithms for OT Linear Models](https://arxiv.org/html/2504.04609v1) (2025)
 - [Near-Linear Time Approximation Algorithms for OT via Sinkhorn](https://arxiv.org/pdf/1705.09634) (NeurIPS 2017)
