@@ -484,7 +484,25 @@ and fits values in a single optimization loop. Each iteration:
 3. Update the combination weights (line search or fixed step)
 
 **Convergence:** O(1/t) rate for smooth objectives, with the sparsity of the
-solution directly matching the budget constraint.
+solution directly matching the budget constraint. Strongly convex + polyhedral
+constraints give linear convergence (away-step FW, pairwise FW).
+
+### The greedy methods hierarchy (all are FW variants)
+
+Clarkson (2010) and Jaggi (ICML 2013) proved the unification:
+
+| Method | FW interpretation | Per-iteration cost |
+|---|---|---|
+| Matching Pursuit | FW with fixed step | O(Td) for atom selection |
+| OMP (current pipeline) | Fully Corrective FW | O(t²d) — re-optimize all weights |
+| Forward Greedy | FW with line search | O(Td + td) |
+| Away-step FW | FW that can remove atoms | O(Td + t) — sparser solutions |
+| Pairwise FW | FW swapping weight between atoms | O(Td + t) |
+
+**Away-step FW is particularly interesting:** it can *drop* previously selected
+keys if they become redundant as new keys are added. This produces sparser
+solutions than OMP's monotonically growing selection set, potentially yielding
+better quality at the same budget t.
 
 ### Deep theoretical connection: attention IS Frank-Wolfe
 
@@ -673,10 +691,25 @@ weight matrices via SVD into y = xAB, caches only the compressed intermediate
 xA, and reconstructs on the fly. Achieves 91%+ compression — but requires
 model-specific decomposition rather than post-hoc compaction.
 
+### Sketching vs. subset selection: when to use which
+
+| Property | Matrix Sketching (FD) | Subset Selection (current) |
+|---|---|---|
+| Error type | Additive: ||A-A_k||_F² / (l-k) | Relative: (1+f(k)) · ||A-A_k||_F |
+| Solution structure | Dense linear combinations (synthetic) | Actual K/V pairs (interpretable) |
+| Streaming | Natural (designed for it) | Harder; needs approximate leverage scores |
+| FlashAttention compat | Requires custom kernels | Works unmodified |
+| Softmax compatibility | Covariance guarantee fails through softmax | Real keys work natively |
+
+**Bottom line:** subset selection wins for keys (softmax compatibility), but
+sketching may win for values (where exact correspondence doesn't matter and
+tighter error bounds apply).
+
 ### Papers
 - Liberty, "Simple and Deterministic Matrix Sketching" (KDD 2013)
 - Ghashami et al., "Frequent Directions: Simple and Deterministic Matrix Sketching" (SIAM 2016)
 - [PALU: KV-Cache Compression with Low-Rank Projection](https://arxiv.org/abs/2407.21118) (ICLR 2025)
+- [Limits of KV-Cache Compression in Tensor Transformer Decoding](https://arxiv.org/abs/2503.11108) (2025) — JL-based fundamental tradeoffs
 
 ---
 
@@ -775,6 +808,15 @@ validates the current approach's choice of NNLS over basis pursuit.
 **Direct application:** CS-VLM (2025) explicitly frames attention as
 compressed sensing, projecting K/V into lower dimensions and using sparse
 recovery (ISTA, OMP, or learned LISTA) to reconstruct attention outputs.
+
+**Temperature-coherence tradeoff.** The softmax temperature (1/√d) controls
+recovery difficulty: low temperature → sparse attention → columns of M are
+more distinct → better sparse recovery. High temperature → uniform attention →
+columns similar → high coherence → worse recovery. At low temperature, M
+approximates a sparse binary matrix, closer to matrices with known RIP
+guarantees. No formal RIP analysis exists for softmax measurement matrices —
+Mendelson's small ball method (which bypasses the zero-mean assumption) is the
+most promising theoretical approach.
 
 ### Papers
 - Candès & Tao, "Near-Optimal Signal Recovery from Random Projections" (IEEE IT 2006)
@@ -1375,3 +1417,21 @@ algorithms, and principled design choices.
    to determine theoretical compression floor (t_min = rank(V) + 1). Heads
    with low-rank values can be compressed far more aggressively than the
    current sensitivity heuristic suggests.
+
+### Open Theoretical Questions
+
+1. **No RIP analysis for softmax measurement matrices.** The mass matching
+   matrix M has exponential entries — standard RIP proofs fail. Mendelson's
+   small ball method is the most promising approach (Section 15).
+2. **Softmax bottleneck for sketching.** Frequent Directions' covariance
+   guarantee does not transfer through softmax. No error analysis exists for
+   sketched keys through the exp nonlinearity (Section 13).
+3. **FW-attention connection is hardmax only.** Alcalde et al. (2025) prove
+   attention = Frank-Wolfe in the zero-temperature limit. Extending to finite
+   temperature softmax with formal compaction guarantees is open (Section 9).
+4. **CKA value fitting is untested.** Whether CKA-based fitting produces
+   better downstream task performance than MSE for KV compaction is unknown
+   (Section 14).
+5. **Coreset size for softmax kernels.** The O(1/ε²) bound from KDE coresets
+   applies to the exponential kernel — but the softmax normalization adds a
+   query-dependent denominator that may require larger coresets (Section 2).
