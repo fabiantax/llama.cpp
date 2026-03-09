@@ -72,6 +72,10 @@ add_library(${TARGET} STATIC
     log.h
     ngram-cache.cpp
     ngram-cache.h
+    uma-profiler.cpp
+    uma-profiler.h
+    apex-scheduler.cpp
+    apex-scheduler.h
     ngram-map.cpp
     ngram-map.h
     ngram-mod.cpp

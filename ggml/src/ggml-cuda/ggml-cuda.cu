@@ -20,6 +20,7 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
+#include "ggml-cuda/delta-net-recurrence.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
@@ -116,10 +117,41 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static bool ggml_cuda_uma_prefetch_enabled();  // forward declaration
+
+static bool ggml_cuda_is_device_uma(int device) {
+    // Cache results per device to avoid repeated cudaGetDeviceProperties calls
+    static bool cached[GGML_CUDA_MAX_DEVICES] = {};
+    static bool results[GGML_CUDA_MAX_DEVICES] = {};
+    static bool uma_env_checked = false;
+    static bool uma_env = false;
+
+    if (!uma_env_checked) {
+        uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
+        uma_env_checked = true;
+    }
+    if (uma_env) {
+        return true;
+    }
+
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && cached[device]) {
+        return results[device];
+    }
+
+#if defined(GGML_USE_HIP)
+    // On HIP, do NOT auto-detect integrated GPUs for UMA allocation.
+    // hipMallocManaged on RDNA 3.5 iGPUs causes runtime crashes.
+    // Users must explicitly set GGML_CUDA_ENABLE_UNIFIED_MEMORY=1.
+    GGML_UNUSED(device);
+#endif
+
+    return false;
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
-    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+    if (ggml_cuda_is_device_uma(device)) {
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
@@ -259,6 +291,25 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO("  Device %d: %s, %s (0x%x), VMM: %s, Wave Size: %d\n",
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize);
+
+        // Warn RDNA 3.5 users about poor default rocBLAS performance (ref: #13565)
+        if (GGML_CUDA_CC_IS_RDNA3_5(info.devices[id].cc) && getenv("ROCBLAS_USE_HIPBLASLT") == nullptr) {
+            GGML_LOG_WARN("  RDNA 3.5 detected: set ROCBLAS_USE_HIPBLASLT=1 for 2-3x faster prompt processing\n");
+        }
+
+        // Use spin scheduling for integrated GPUs to reduce synchronization latency
+        if (prop.integrated) {
+            cudaError_t flags_err = cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+            if (flags_err != cudaSuccess) {
+                GGML_LOG_WARN("  Device %d: cudaSetDeviceFlags(Spin) failed, ignoring\n", id);
+                (void)cudaGetLastError(); // clear the error
+            }
+        }
+
+        // Log UMA auto-detection for integrated GPUs
+        if (prop.integrated) {
+            GGML_LOG_INFO("  Device %d: integrated GPU detected, using unified memory\n", id);
+        }
 #elif defined(GGML_USE_MUSA)
         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
         info.devices[id].warp_size = 32;
@@ -2367,12 +2418,53 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
 
+    // On UMA systems (e.g. Strix Halo), prefetch only the active expert weight
+    // slices instead of the entire tensor. This avoids polluting the Infinity
+    // Cache / MALL with unused expert data and reduces wasted bandwidth.
+    const bool uma_expert_prefetch = ggml_cuda_is_device_uma(ggml_cuda_get_device())
+                                  && ggml_cuda_uma_prefetch_enabled();
+
+    // Prefetch the first active expert's weights before the loop starts
+#if !defined(GGML_USE_MUSA)
+    if (uma_expert_prefetch) {
+        for (int64_t first = 0; first < ne02; ++first) {
+            if (tokens_per_expert[first] > 0) {
+                const char * first_data = (const char *) src0->data + first * nb02;
+                const size_t slice_bytes = (size_t) nb02;
+                if (slice_bytes >= 4096) {
+                    cudaMemPrefetchAsync(first_data, slice_bytes, ggml_cuda_get_device(), stream);
+                }
+                break;
+            }
+        }
+    }
+#endif
+
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
         }
+
+        // UMA expert-aware prefetch: while computing with the current expert,
+        // prefetch the next active expert's weight slice to overlap DRAM access
+        // with GPU compute. Only prefetches the specific expert slice (~1/N of
+        // the full tensor), keeping Infinity Cache / MALL pressure low.
+#if !defined(GGML_USE_MUSA)
+        if (uma_expert_prefetch) {
+            for (int64_t next = i02 + 1; next < ne02; ++next) {
+                if (tokens_per_expert[next] > 0) {
+                    const char * next_data = (const char *) src0->data + next * nb02;
+                    const size_t slice_bytes = (size_t) nb02;
+                    if (slice_bytes >= 4096) {
+                        cudaMemPrefetchAsync(next_data, slice_bytes, ggml_cuda_get_device(), stream);
+                    }
+                    break;
+                }
+            }
+        }
+#endif
 
         ggml_tensor src0_slice = *src0;
         src0_slice.ne[2]    = 1;
@@ -2711,6 +2803,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
+            break;
+        case GGML_OP_DELTA_NET_RECURRENCE:
+            ggml_cuda_op_delta_net_recurrence(ctx, dst);
             break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
@@ -3366,11 +3461,100 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Check if UMA weight prefetching is enabled.
+// On UMA/integrated GPU systems (e.g. AMD Strix Halo), issuing hipMemPrefetchAsync
+// for upcoming weight tensors hides memory-to-TLB/cache latency behind compute.
+static bool ggml_cuda_uma_prefetch_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_CUDA_UMA_PREFETCH");
+        if (env) {
+            enabled = atoi(env);
+        } else {
+            // Auto-enable on UMA devices
+            enabled = 2; // 2 = auto-detect per device
+        }
+    }
+    return enabled != 0;
+}
+
+// Number of nodes to look ahead for prefetching weight tensors.
+// A small lookahead (2-4) balances hiding latency vs. cache pollution.
+static int ggml_cuda_uma_prefetch_lookahead() {
+    static int lookahead = -1;
+    if (lookahead < 0) {
+        const char * env = getenv("GGML_CUDA_UMA_PREFETCH_LOOKAHEAD");
+        lookahead = env ? atoi(env) : 3;
+        if (lookahead < 1) { lookahead = 1; }
+        if (lookahead > 8) { lookahead = 8; }
+    }
+    return lookahead;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+
+    // UMA weight prefetching: on integrated GPUs with unified memory, prefetch weight
+    // tensors of upcoming MUL_MAT operations into the GPU TLB/cache while current
+    // operations are executing. This hides memory latency behind compute.
+    // Note: we use ggml_cuda_is_device_uma() instead of the info.integrated flag,
+    // which is temporarily disabled (#15034). ggml_cuda_is_device_uma() queries
+    // prop.integrated directly and also respects GGML_CUDA_ENABLE_UNIFIED_MEMORY.
+    const bool uma_prefetch = ggml_cuda_is_device_uma(cuda_ctx->device) && ggml_cuda_uma_prefetch_enabled();
+    const int  prefetch_lookahead = uma_prefetch ? ggml_cuda_uma_prefetch_lookahead() : 0;
+    const int  device = cuda_ctx->device;
+
+    if (uma_prefetch) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("%s: UMA weight prefetching enabled (lookahead=%d)\n", __func__, prefetch_lookahead);
+            logged = true;
+        }
+    }
+
+    // Helper: issue prefetch for weight tensors of a graph node.
+    // Only prefetches src[0] (weights) for MUL_MAT/MUL_MAT_ID ops, as these are
+    // the largest tensors and dominate memory bandwidth during token generation.
+    //
+    // For MUL_MAT_ID (MoE expert dispatch), we skip bulk prefetch of the entire
+    // expert weight tensor because only top-K experts are used per token.
+    // Prefetching all experts wastes shared memory bandwidth and pollutes the
+    // Infinity Cache / MALL on AMD UMA systems (e.g. 32MB on Strix Halo).
+    // Instead, per-expert prefetch is handled inside ggml_cuda_mul_mat_id.
+    const auto prefetch_node_weights = [&](int node_idx) {
+        if (node_idx >= cgraph->n_nodes) {
+            return;
+        }
+        const ggml_tensor * future_node = cgraph->nodes[node_idx];
+        if (future_node->op != GGML_OP_MUL_MAT && future_node->op != GGML_OP_MUL_MAT_ID) {
+            return;
+        }
+        // Skip MUL_MAT_ID: bulk prefetch of all expert weights wastes bandwidth.
+        // Only top-K of N experts are active; expert-aware prefetch happens at
+        // execution time inside the MUL_MAT_ID handler.
+        if (future_node->op == GGML_OP_MUL_MAT_ID) {
+            return;
+        }
+        const ggml_tensor * weights = future_node->src[0];
+        if (weights == nullptr || weights->data == nullptr) {
+            return;
+        }
+        // Only prefetch if the weight tensor is in a CUDA buffer (not split across devices)
+        if (weights->buffer == nullptr || ggml_backend_buft_is_cuda_split(weights->buffer->buft)) {
+            return;
+        }
+        const size_t nbytes = ggml_nbytes(weights);
+        // Skip very small tensors (not worth the API call overhead)
+        if (nbytes < 4096) {
+            return;
+        }
+#if !defined(GGML_USE_MUSA)
+        cudaMemPrefetchAsync(weights->data, nbytes, device, cuda_ctx->stream());
+#endif
+    };
 
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
@@ -3848,6 +4032,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #else
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
+
+                // Prefetch weight tensors for upcoming MUL_MAT operations on UMA systems.
+                // This overlaps memory-to-cache migration with the current node's compute.
+                if (uma_prefetch) {
+                    for (int la = 1; la <= prefetch_lookahead; ++la) {
+                        prefetch_node_weights(i + la);
+                    }
+                }
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
@@ -4448,7 +4640,10 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
-    GGML_UNUSED(dev);
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    if (ggml_cuda_is_device_uma(ctx->device)) {
+        return GGML_BACKEND_DEVICE_TYPE_IGPU;
+    }
     return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
@@ -4793,6 +4988,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
+        }
+        case GGML_OP_DELTA_NET_RECURRENCE: {
+            // requires S=128 (state dimension)
+            return op->src[1]->ne[0] == 128;
         }
         case GGML_OP_CONT:
             return true;
