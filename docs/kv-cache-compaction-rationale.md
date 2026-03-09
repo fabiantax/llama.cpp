@@ -5,7 +5,104 @@ and where the real leverage is for doing better.
 
 ---
 
-## 1. The Fundamental Insight: Work in Latent Space, Not Token Space
+## 1. Cartridges: The Prior Art That Motivated Everything
+
+Attention Matching exists because of the limitations of **Cartridges**
+(Eyuboglu et al., 2025, Stanford Hazy Research). Understanding Cartridges
+is essential to understanding why the Attention Matching researchers made
+every subsequent design choice.
+
+### What Cartridges are
+
+A Cartridge is a small, trained KV cache that replaces the full KV cache for
+a given context. Instead of running a forward pass to populate the cache, you
+*optimize* the K and V vectors directly via gradient descent — essentially
+[prefix tuning](https://arxiv.org/abs/2101.00190) applied to KV cache
+compression.
+
+The representation is just a standard KV cache (same tensor format, same
+attention interface), but with fewer entries whose vectors have been tuned to
+reproduce the behavior of the full cache.
+
+### The self-study training process
+
+Naive training (next-token prediction on the raw context) leads to
+memorization — the cartridge overfits to the exact token sequence and fails
+to generalize to questions *about* the content. The key innovation:
+
+1. **Generate synthetic Q&A pairs.** The model quizzes itself about the
+   context, producing diverse question-answer conversations.
+2. **Train via context distillation.** The cartridge's KV vectors are
+   optimized so the model produces correct answers to these synthetic
+   questions when attending to the cartridge instead of the full context.
+3. **Never see the same text twice.** Each training example is a unique
+   synthetic conversation, preventing rote memorization.
+
+This is analogous to how a student learns better by doing practice problems
+than by re-reading the textbook.
+
+### What Cartridges achieve
+
+| Metric | Result |
+|--------|--------|
+| Memory compression | Up to 38.6x less than full KV cache |
+| Throughput | 26.4x higher peak throughput (multi-user serving) |
+| LongHealth (medical QA) | 55.1% accuracy at 13.8x compression (vs 71.5% full context) |
+| Extreme compression | 47.7% at 256x compression |
+| Context extension | Extends effective context 4x beyond model's native limit |
+
+Cartridges can be combined without retraining, precomputed offline during
+cheap compute windows ("sleep-time compute"), and plugged into existing
+inference servers with no architectural changes.
+
+### Why the Attention Matching researchers moved past Cartridges
+
+**The fatal flaw: training time.** Cartridges require end-to-end gradient
+optimization through the full transformer — backpropagating through attention
+layers, computing per-token losses, iterating over synthetic Q&A data. This
+costs **GPU-hours per context**.
+
+For a single static context served to many users, this amortizes well. But
+for the general case — user uploads a document, asks one question, never
+returns — spending hours to compress the cache is absurd.
+
+**The Attention Matching insight:** Cartridges work by making the compressed
+cache produce the same attention outputs as the full cache. But you don't
+need gradient descent to match attention outputs — you can decompose the
+problem into three convex subproblems with closed-form solutions. This gives
+comparable quality in **seconds instead of hours**.
+
+### The quality-speed Pareto frontier
+
+```
+Quality
+  ^
+  |   * Cartridges (hours)
+  |  ** AM-OMP (minutes)         <-- matches Cartridges at moderate compression
+  | **  AM-HighestAttn (seconds) <-- Pareto-optimal for most use cases
+  |*    Token eviction (instant)
+  +---------------------------------> Speed
+```
+
+At moderate compression (10-50x), Attention Matching matches Cartridges.
+At extreme compression (100x+), Cartridges still wins because gradient
+search explores a wider representation space. The Attention Matching
+researchers explicitly accepted this trade-off.
+
+### What Cartridges got right that carries forward
+
+1. **Latent space is the right abstraction.** Token eviction has a hard
+   ceiling; optimizing vectors in continuous space does not.
+2. **Self-study generates better training signal than raw text.** The
+   Attention Matching paper adopted this idea directly for their "Self-Study"
+   reference query strategy (though it's their slowest option at 139s).
+3. **The KV cache format is the right interface.** Both methods produce
+   standard KV caches — no model changes, no custom kernels, drop-in
+   compatible with existing inference.
+
+---
+
+## 2. The Fundamental Insight: Work in Latent Space, Not Token Space
 
 **Prior art (H2O, SnapKV, PyramidKV, KVzip):** All operate in *token space* —
 they decide which tokens to keep or drop. This has a hard ceiling: at 50x
@@ -31,7 +128,7 @@ non-convex.
 
 ---
 
-## 2. The Decomposition: Why Three Steps Instead of Joint Optimization
+## 3. The Decomposition: Why Three Steps Instead of Joint Optimization
 
 The "obvious" approach is to jointly optimize (C_k, beta, C_v) to minimize
 attention output error. The researchers rejected this because:
@@ -63,7 +160,7 @@ losing convexity would help. For example:
 
 ---
 
-## 3. Key Selection: Why "Max Attention" and Not Something Smarter
+## 4. Key Selection: Why "Max Attention" and Not Something Smarter
 
 The Highest Attention method scores each key by:
 
@@ -101,7 +198,7 @@ don't.
 
 ---
 
-## 4. Why the Bias Term beta Is the Key Innovation
+## 5. Why the Bias Term beta Is the Key Innovation
 
 **The insight that makes everything work:**
 
@@ -133,7 +230,7 @@ compacted token, vs 2*d floats for K+V. For d=128, that's 0.4% overhead.
 
 ---
 
-## 5. Why NNLS and Not Unconstrained Least Squares for Bias
+## 6. Why NNLS and Not Unconstrained Least Squares for Bias
 
 The mass matching problem is:
 
@@ -168,7 +265,7 @@ large positive and negative terms nearly cancel.
 
 ---
 
-## 6. Value Fitting: Why Least Squares Is (Almost) Optimal
+## 7. Value Fitting: Why Least Squares Is (Almost) Optimal
 
 Step 3 solves:
 
@@ -206,7 +303,7 @@ correct outputs for reference queries but terrible outputs for new queries.
 
 ---
 
-## 7. Reference Queries: The Hidden Critical Dependency
+## 8. Reference Queries: The Hidden Critical Dependency
 
 **The entire method optimizes against Q_ref.** If Q_ref doesn't represent
 future queries well, the compacted cache will be tuned for the wrong use
@@ -237,7 +334,7 @@ full forward pass (~8s for 60k tokens). This doubles the prefill cost.
 
 ---
 
-## 8. Per-Head Budget Allocation: The Most Impactful Component
+## 9. Per-Head Budget Allocation: The Most Impactful Component
 
 **The ablation results are striking:** nonuniform head budgets matter more
 than bias fitting, more than value refitting, more than query strategy.
@@ -268,7 +365,7 @@ curves, then run a greedy exchange algorithm to find the optimal allocation.
 
 ---
 
-## 9. The Researchers' Implicit Assumptions
+## 10. The Researchers' Implicit Assumptions
 
 Several assumptions underpin the method. Questioning them may reveal
 improvement paths:
@@ -310,7 +407,7 @@ rows. For high compression (t << T), this subspace may be too constrained.
 
 ---
 
-## 10. Ranked Improvement Opportunities
+## 11. Ranked Improvement Opportunities
 
 Based on the researchers' own ablation data and the structural analysis above,
 ranked by expected impact and feasibility:
@@ -363,7 +460,7 @@ ranked by expected impact and feasibility:
 
 ---
 
-## 11. What the Timing Data Tells Us
+## 12. What the Timing Data Tells Us
 
 From the paper's breakdown (60k tokens, Gemma-3-12B, H200):
 
@@ -384,7 +481,7 @@ but it's still 50x slower than Highest Attention.
 
 ---
 
-## 12. Summary: The Core Trade-off Chain
+## 13. Summary: The Core Trade-off Chain
 
 ```
 Joint optimization (Cartridges)
