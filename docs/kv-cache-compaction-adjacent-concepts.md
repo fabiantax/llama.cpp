@@ -121,10 +121,30 @@ where s_total = sum of all sensitivities.
 tolerance eps, coreset theory tells you the minimum number of keys you need.
 The current method has no such guarantee.
 
+**Concrete size bound (Feldman-Langberg):** An eps-coreset requires:
+
+```
+|C| = O( S_total · log(S_total) · (dim + log(1/δ)) / ε² )
+```
+
+where S_total = sum of all sensitivities, dim = pseudo-dimension of the query
+space, δ = failure probability. For kernel density estimation with exponential/
+softmax kernels, this simplifies to **O(1/ε²), independent of sequence length
+T and ambient dimension** (Phillips & Tai, SoCG 2018). This means the number
+of keys needed depends only on the approximation tolerance, not on how long
+the context is.
+
+**Construction algorithm:**
+1. Compute upper bounds m(j) on sensitivity for each key j
+2. Sample |C| keys with probability proportional to m(j)
+3. Assign weight w_j = 1 / (|C| · p_j) to each sampled key
+4. The weights are exactly exp(beta_j) — the bias term
+
 ### Papers
 - [Improved Coresets for Kernel Density Estimates](https://dl.acm.org/doi/abs/10.5555/3174304.3175477) (SODA 2018) — O(1/eps^2) coreset size, dimension-independent
 - Feldman & Langberg, "A Unified Framework for Approximating and Clustering Data" (STOC 2011)
 - [Efficient Coreset Constructions via Sensitivity Sampling](https://proceedings.mlr.press/v157/braverman21a.html) (ACML 2021)
+- [Optimal KDE Coresets in Near-Linear Time](https://arxiv.org/abs/2205.00084) (Tai, SoCG 2022) — O(1/eps) in constant dimension
 
 ---
 
@@ -889,10 +909,36 @@ This captures diversity automatically.
 **Replace NNLS with pseudoinverse weights.** The Nyström formula
 W = K_{mm}^{-1} K_{mn} gives optimal unconstrained weights in O(t^2 * T)
 time. If non-negativity is needed, project the result or use the
-Caratheodory-based recombination that guarantees positive weights.
+Carathéodory-based recombination that guarantees positive weights (Section 22).
+
+**Why the bias term maps to Nyström normalization.** The Nyström weight matrix
+W gives a normalization vector w = W · 1_n that corrects the softmax
+denominator implicitly. In an NNLS formulation, non-negativity prevents weights
+from freely adjusting, so the explicit bias term β absorbs this "attention
+residual" — the systematic offset from softmax renormalization over a subset.
+Both approaches solve the same underlying problem: the softmax denominator over
+selected keys differs from the denominator over all keys.
 
 **The RPCholesky algorithm is simpler than OMP** (no NNLS sub-solve per
-iteration) while providing stronger theoretical guarantees.
+iteration) while providing stronger theoretical guarantees:
+
+```
+E[||K - K_approx||_op] <= ε
+whenever r >= rank_ε(K) · log(||K||/ε) + tr(K) / ε
+```
+
+where rank_ε is the numerical rank at scale ε — the number of eigenvalues
+above ε. This is near-optimal.
+
+### Error bounds across landmark selection methods
+
+| Method | Columns needed | Error type | Bound |
+|--------|---------------|------------|-------|
+| Uniform random | m | Frobenius | ||K-K_k||_F + (n/√m) · tail(K) |
+| Ridge leverage | O(k log k / ε) | Spectral (1+ε) | (1+ε) · ||K-K_k||_op |
+| DPP sampling | m | Expected spectral | (1 + k/(m-k+1)) · ||K-K_k||_op |
+| RPCholesky | r (adaptive) | Expected spectral | rank_ε · log(||K||/ε) + tr(K)/ε |
+| **WildCat (attention)** | r (adaptive) | **Max-norm on output** | **3 · ||V||_max · n^{-a}** |
 
 ### Comparison to current pipeline
 
@@ -1116,7 +1162,11 @@ that the current pipeline lacks.
 **Carathéodory recombination** is the constructive algorithm: iteratively find
 linear dependencies among value vectors (which must exist when n > d+1), shift
 weight off one vector, eliminate it. Repeat until d+1 remain. Runs in
-O(n · d^2) per elimination step.
+O(n · d^2) per elimination step. **Crucially, the resulting weights are
+guaranteed non-negative** (they form a convex combination), which maps directly
+onto the requirement that attention weights post-softmax are non-negative. This
+makes Carathéodory recombination an alternative to NNLS that produces provably
+non-negative weights by construction, without iterative optimization.
 
 **The key limitation:** attention weights are query-dependent. A single static
 Carathéodory reduction preserves the output for one query but not all future
