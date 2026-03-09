@@ -3087,6 +3087,12 @@ static const std::unordered_map<std::string, uint32_t> rdna2_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
 };
 
+// Pipeline configuration for RDNA3 GPUs.
+static const std::unordered_map<std::string, uint32_t> rdna3_pipelines = {
+    {"soft_max", 64}, {"im2col", 64},
+    {"flash_attn", 64},
+};
+
 static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
 
 // Define configurations for different GPUs.
