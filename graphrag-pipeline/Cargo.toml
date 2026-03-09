@@ -1,0 +1,22 @@
+[package]
+name = "graphrag-pipeline"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gline-rs = { version = "1", features = ["load-dynamic"] }
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
+composable = "0.9"
+orp = "0.9.2"
+falkordb = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[patch.crates-io]
+orp = { path = "orp-patched" }

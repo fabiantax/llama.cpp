@@ -1,0 +1,35 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "6379:6379"
+      - "3000:3000"   # Browser UI
+    volumes:
+      - falkordb-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  graphrag:
+    build: .
+    network_mode: host
+    depends_on:
+      - falkordb
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+    volumes:
+      - ./sources:/app/sources:ro
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+          cpus: "4"
+    # Override args per run:
+    #   docker compose run graphrag --source sources/flashrnn.txt --dry-run
+    #   docker compose run graphrag --source sources/flashrnn.txt --ner-only
+    command: ["--source", "sources/flashrnn.txt", "--dry-run"]
+
+volumes:
+  falkordb-data:
