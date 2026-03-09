@@ -138,3 +138,29 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# GraphRAG pipeline artifacts
+graphrag-pipeline/target/
+graphrag-pipeline/models/
+graphrag-pipeline/training/checkpoints/
+graphrag-pipeline/training/data/
+graphrag-pipeline/training/__pycache__/
+graphrag-pipeline/proptest-regressions/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Claude Code worktrees and local settings
+.claude/worktrees/
+.claude/settings.local.json
+
+# Backup files
+*.bak
+
+# Misc
+migrate_to_falkordb.mjs
+perf_log_broadcast.txt
+perf_log_broadcast_extracted.json
+*.obj
+graphrag-pipeline/sources/*_extracted.json
