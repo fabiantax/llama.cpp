@@ -26,6 +26,8 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    uint32_t n_swa_hybrid;    // sliding window for attention layers in hybrid models (0 = disabled)
+
     bool embeddings;
     bool causal_attn;
     bool offload_kqv;

@@ -8281,15 +8281,30 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
+                        // Allow user-specified sliding window for attention layers in hybrid models
+                        // When n_swa_hybrid > 0, attention layers use a sliding window KV cache
+                        // while SSM layers continue to maintain full long-range context via recurrent state.
+                        // This dramatically reduces per-agent memory for multi-agent serving.
+                        const uint32_t   attn_n_swa    = cparams.n_swa_hybrid > 0 ? cparams.n_swa_hybrid : hparams.n_swa;
+                        const auto       attn_swa_type = cparams.n_swa_hybrid > 0 ? LLAMA_SWA_TYPE_STANDARD : hparams.swa_type;
+                        const uint32_t   attn_kv_size  = cparams.n_swa_hybrid > 0
+                            ? std::min(cparams.n_ctx_seq, cparams.n_swa_hybrid)
+                            : cparams.n_ctx_seq;
+
+                        if (cparams.n_swa_hybrid > 0) {
+                            LLAMA_LOG_INFO("%s: using hybrid SWA with window size %u (KV cache limited to %u cells)\n",
+                                __func__, cparams.n_swa_hybrid, attn_kv_size);
+                        }
+
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
+                            /* attn_n_swa        */ attn_n_swa,
+                            /* attn_swa_type     */ attn_swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),

@@ -1279,6 +1279,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
+        {"--swa-hybrid"}, "N",
+        "sliding window size for attention layers in hybrid SSM+attention models (default: 0 = disabled)\n"
+        "reduces KV cache memory per agent for multi-agent serving while SSM layers maintain long-range context",
+        [](common_params & params, int value) {
+            params.n_swa_hybrid = value;
+        }
+    ).set_env("LLAMA_ARG_SWA_HYBRID"));
+    add_opt(common_arg(
         {"--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),

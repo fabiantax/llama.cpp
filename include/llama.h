@@ -347,6 +347,10 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        uint32_t n_swa_hybrid;     // sliding window size for attention layers in hybrid SSM+attention models
+                                   // 0 = disabled (use full context), >0 = limit attention KV cache to this window
+                                   // useful for multi-agent serving where SSM layers handle long-range context
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 

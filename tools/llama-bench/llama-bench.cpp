@@ -338,6 +338,7 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
+    int                              n_swa_hybrid;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -377,6 +378,7 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
+    /* n_swa_hybrid         */ 0,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -461,6 +463,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nopo, --no-op-offload <0|1>              (default: 0)\n");
     printf("  --no-host <0|1>                           (default: %s)\n",
            join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --swa-hybrid <n>                          sliding window for hybrid SSM+attn models (default: %d)\n",
+           cmd_params_defaults.n_swa_hybrid);
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -804,6 +808,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--swa-hybrid") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.n_swa_hybrid = std::stoi(argv[i]);
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1074,6 +1084,7 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    int                n_swa_hybrid;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1151,6 +1162,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.n_swa_hybrid    = n_swa_hybrid;
 
         return cparams;
     }
@@ -1216,6 +1228,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .n_swa_hybrid = */ params.n_swa_hybrid,
             };
             instances.push_back(instance);
         }
@@ -1251,6 +1264,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .n_swa_hybrid = */ params.n_swa_hybrid,
             };
             instances.push_back(instance);
         }
@@ -1286,6 +1300,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .n_swa_hybrid = */ params.n_swa_hybrid,
             };
             instances.push_back(instance);
         }
