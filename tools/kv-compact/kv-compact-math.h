@@ -348,13 +348,10 @@ static compacted_head compact_head_highest_attn(
     //   Solve: X * C_v = Y
 
     // Compute X: attention weights with compacted keys + bias
+    // scores[] are already scaled by inv_sqrt_dk (line 286), so just add beta
     std::vector<float> X(n_q * t);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < t; j++) {
-            X[i * t + j] = scores[i * T + selected[j]] * inv_sqrt_dk + result.beta[j];
-            // Wait, scores was already scaled. Let me recompute properly.
-            // Actually scores[i*T + selected[j]] is already q*K/sqrt(d)
-            // But we already scaled scores by inv_sqrt_dk above, so:
             X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
         }
     }

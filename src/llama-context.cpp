@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-compact.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3166,6 +3167,25 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// KV cache compaction API
+
+struct llama_compact_params llama_compact_params_default(void) {
+    return {
+        /*.target_ratio           =*/ 0.5f,
+        /*.n_ref_queries          =*/ 0,
+        /*.use_repeat_prefill     =*/ false,
+        /*.use_nonuniform_budgets =*/ false,
+        /*.budget_profile_path    =*/ nullptr,
+    };
+}
+
+int32_t llama_kv_cache_compact(
+             struct llama_context * ctx,
+                       llama_seq_id seq_id,
+        struct llama_compact_params params) {
+    return llama_kv_compact_impl(ctx, seq_id, params);
 }
 
 // llama state API

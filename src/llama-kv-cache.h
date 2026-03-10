@@ -199,6 +199,59 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    //
+    // compaction API
+    //
+
+    // returns true if any layer/head has compaction bias set
+    bool has_compaction_bias() const;
+
+    // set compaction bias for a specific layer, head, and cell position
+    // bias is added to attention scores (pre-softmax) for compacted keys
+    void set_compaction_bias(int32_t il, uint32_t head_kv, uint32_t cell_idx, float beta);
+
+    // clear all compaction biases (e.g. after cache clear or full recomputation)
+    void clear_compaction_bias();
+
+    // get the number of KV heads for bias indexing
+    uint32_t get_n_head_kv() const;
+
+    // get the kv_size for bias indexing
+    uint32_t get_kv_size() const;
+
+    // write compacted K data back to cache for a specific layer and head
+    // k_data: [n_kept, n_embd_head_k] in F32
+    // kept_indices: original cell indices that were kept (size n_kept)
+    void write_k_compact(int32_t il, uint32_t head_kv,
+                         const float * k_data, const uint32_t * kept_indices, uint32_t n_kept);
+
+    // write compacted V data (C_v) back to cache for a specific layer and head
+    // v_data: [n_kept, n_embd_head_v] in F32
+    // kept_indices: original cell indices that were kept (size n_kept)
+    void write_v_compact(int32_t il, uint32_t head_kv,
+                         const float * v_data, const uint32_t * kept_indices, uint32_t n_kept);
+
+    // after compaction: evict cells not in kept set and defragment
+    // kept_indices: sorted array of cell indices to keep (size n_kept)
+    // stream: the stream index to compact
+    void compact_cells(const uint32_t * kept_indices, uint32_t n_kept, uint32_t stream);
+
+    // get raw K/V tensors for a model layer (for reading data during compaction)
+    ggml_tensor * get_k_raw(int32_t il) const;
+    ggml_tensor * get_v_raw(int32_t il) const;
+
+    // check if V is transposed
+    bool get_v_trans() const;
+
+    // get number of active cells in a stream
+    uint32_t get_used_cells(uint32_t stream) const;
+
+    // get cell position for a cell index
+    llama_pos get_cell_pos(uint32_t stream, uint32_t cell_idx) const;
+
+    // check if cell is empty
+    bool is_cell_empty(uint32_t stream, uint32_t cell_idx) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -251,6 +304,12 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // compaction bias storage (CPU-side)
+    // indexed as: compaction_bias[kv_layer_id][head_kv * kv_size + cell_idx]
+    // values are added to attention scores (pre-softmax) for compacted keys
+    std::vector<std::vector<float>> compaction_bias;
+    bool compaction_bias_active = false; // fast check to skip bias logic when no biases set
 
     size_t total_size() const;
 
@@ -326,6 +385,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // returns true if the underlying cache has compaction bias values
+    bool has_compaction_bias() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

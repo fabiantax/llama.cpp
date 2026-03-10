@@ -224,6 +224,8 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    clear_compaction_bias();
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1265,6 +1267,10 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // compaction bias (optional, may be empty)
+    const std::vector<std::vector<float>> & compaction_bias;
+    bool                                    has_bias;
 };
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
@@ -1449,15 +1455,27 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
-    const int64_t n_kv     = dst->ne[0];
-    const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+    const int64_t n_kv        = dst->ne[0];
+    const int64_t n_head_mask = dst->ne[2]; // 1 when no bias, n_head when bias active
+    const int64_t n_stream    = dst->ne[3]; // num streams in the current ubatch
 
     GGML_ASSERT(n_tokens%n_stream == 0);
 
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    //const int64_t t_start = ggml_time_us();
+    const bool has_bias = compaction_bias_active && n_head_mask > 1;
+
+    // when bias is active, the mask tensor is [n_kv, n_tps, n_head, n_stream]
+    // we fill a temporary base mask [n_kv * n_tps * n_stream] (broadcast dim 2 = 1),
+    // then expand it across heads and add per-head bias values
+    std::vector<float> base_mask;
+    float * fill_data = data;
+
+    if (has_bias) {
+        base_mask.resize(n_kv * n_tps * n_stream);
+        fill_data = base_mask.data();
+    }
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1469,17 +1487,67 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.compaction_bias  =*/ compaction_bias,
+        /*.has_bias         =*/ has_bias,
     };
 
     if (causal_attn) {
-        set_input_kq_mask_impl<true> (args, data);
+        set_input_kq_mask_impl<true> (args, fill_data);
     } else {
-        set_input_kq_mask_impl<false>(args, data);
+        set_input_kq_mask_impl<false>(args, fill_data);
     }
 
-    //const int64_t t_end = ggml_time_us();
+    // expand base mask across heads and add per-head compaction bias
+    if (has_bias) {
+        const uint32_t n_head    = (uint32_t) n_head_mask;
+        const uint32_t n_head_kv = hparams.n_head_kv();
+        const uint32_t gqa_ratio = n_head / n_head_kv;
+        const uint32_t kv_size   = get_kv_size();
 
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+        for (int64_t s = 0; s < n_stream; ++s) {
+            // base mask for this stream: base_mask[s * n_tps * n_kv ... ]
+            const float * base_s = base_mask.data() + s * n_tps * n_kv;
+
+            for (uint32_t h = 0; h < n_head; ++h) {
+                const uint32_t kv_head = h / gqa_ratio;
+
+                // destination: data[s * n_head * n_tps * n_kv + h * n_tps * n_kv + ...]
+                float * dst_h = data + s * n_head * n_tps * n_kv + h * n_tps * n_kv;
+
+                // copy base mask for this head
+                std::copy(base_s, base_s + n_tps * n_kv, dst_h);
+
+                // add per-key compaction bias for this KV head
+                // the attention mask is shared across all model layers, but beta
+                // values are per-layer. we average betas across layers to produce
+                // a single correction per (kv_head, position) pair.
+                // TODO: for higher accuracy, inject per-layer bias in the graph
+                if (!compaction_bias.empty()) {
+                    for (int64_t t = 0; t < n_tps; ++t) {
+                        for (int64_t j = 0; j < n_kv; ++j) {
+                            if (dst_h[t * n_kv + j] > -INFINITY) {
+                                // average bias across all layers for this (kv_head, position)
+                                float avg_bias = 0.0f;
+                                int n_layers_with_bias = 0;
+                                for (const auto & layer_bias : compaction_bias) {
+                                    if (!layer_bias.empty()) {
+                                        const size_t idx = kv_head * kv_size + j;
+                                        if (idx < layer_bias.size()) {
+                                            avg_bias += layer_bias[idx];
+                                            n_layers_with_bias++;
+                                        }
+                                    }
+                                }
+                                if (n_layers_with_bias > 0) {
+                                    dst_h[t * n_kv + j] += avg_bias / n_layers_with_bias;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -1505,6 +1573,219 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
             }
         }
     }
+}
+
+//
+// compaction API
+//
+
+bool llama_kv_cache::has_compaction_bias() const {
+    return compaction_bias_active;
+}
+
+void llama_kv_cache::set_compaction_bias(int32_t il, uint32_t head_kv, uint32_t cell_idx, float beta) {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+
+    const int32_t kv_layer_id = it->second;
+    const uint32_t kv_size = get_kv_size();
+    const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+
+    GGML_ASSERT(head_kv < n_head_kv_l);
+    GGML_ASSERT(cell_idx < kv_size);
+
+    // lazy init: allocate bias vectors on first use
+    if (compaction_bias.empty()) {
+        compaction_bias.resize(layers.size());
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const uint32_t n_hkv = hparams.n_head_kv(layers[i].il);
+            compaction_bias[i].resize(n_hkv * kv_size, 0.0f);
+        }
+    }
+
+    compaction_bias[kv_layer_id][head_kv * kv_size + cell_idx] = beta;
+    compaction_bias_active = true;
+}
+
+void llama_kv_cache::clear_compaction_bias() {
+    for (auto & bias : compaction_bias) {
+        std::fill(bias.begin(), bias.end(), 0.0f);
+    }
+    compaction_bias_active = false;
+}
+
+uint32_t llama_kv_cache::get_n_head_kv() const {
+    return hparams.n_head_kv();
+}
+
+uint32_t llama_kv_cache::get_kv_size() const {
+    return v_cells.empty() ? 0 : v_cells[0].size();
+}
+
+void llama_kv_cache::write_k_compact(int32_t il, uint32_t head_kv,
+                                     const float * k_data, const uint32_t * kept_indices, uint32_t n_kept) {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+
+    const auto & layer = layers[it->second];
+    ggml_tensor * k_tensor = layer.k;
+
+    const uint32_t n_embd_k_gqa = k_tensor->ne[0];
+    const uint32_t n_embd_head_k = hparams.n_embd_head_k;
+    const uint32_t head_offset = head_kv * n_embd_head_k;
+
+    GGML_ASSERT(head_offset + n_embd_head_k <= n_embd_k_gqa);
+
+    if (k_tensor->type == GGML_TYPE_F32) {
+        for (uint32_t i = 0; i < n_kept; ++i) {
+            const uint32_t cell = kept_indices[i];
+            const size_t offset = cell * k_tensor->nb[1] + head_offset * sizeof(float);
+            ggml_backend_tensor_set(k_tensor, k_data + i * n_embd_head_k, offset, n_embd_head_k * sizeof(float));
+        }
+    } else if (k_tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(n_embd_head_k);
+        for (uint32_t i = 0; i < n_kept; ++i) {
+            const uint32_t cell = kept_indices[i];
+            for (uint32_t j = 0; j < n_embd_head_k; ++j) {
+                tmp[j] = ggml_fp32_to_fp16(k_data[i * n_embd_head_k + j]);
+            }
+            const size_t offset = cell * k_tensor->nb[1] + head_offset * ggml_type_size(GGML_TYPE_F16);
+            ggml_backend_tensor_set(k_tensor, tmp.data(), offset, n_embd_head_k * ggml_type_size(GGML_TYPE_F16));
+        }
+    } else {
+        GGML_ABORT("write_k_compact: unsupported K type %s (only F32/F16)", ggml_type_name(k_tensor->type));
+    }
+}
+
+void llama_kv_cache::write_v_compact(int32_t il, uint32_t head_kv,
+                                     const float * v_data, const uint32_t * kept_indices, uint32_t n_kept) {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+
+    const auto & layer = layers[it->second];
+    ggml_tensor * v_tensor = layer.v;
+
+    if (!v_tensor) {
+        return; // MLA models have no V tensor
+    }
+
+    const uint32_t n_embd_v_gqa = v_tensor->ne[0];
+    const uint32_t n_embd_head_v = hparams.n_embd_head_v;
+
+    if (v_trans) {
+        // V is transposed: shape [kv_size, n_embd_v_gqa]
+        // v_data[i][j] needs to go to v_tensor[kept_indices[i]][head_kv * n_embd_head_v + j]
+        // i.e., row j (embedding dim), column kept_indices[i] (kv pos)
+        if (v_tensor->type == GGML_TYPE_F32) {
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                    const float val = v_data[i * n_embd_head_v + j];
+                    const uint32_t v_row = head_kv * n_embd_head_v + j;
+                    const size_t offset = v_row * v_tensor->nb[1] + cell * sizeof(float);
+                    ggml_backend_tensor_set(v_tensor, &val, offset, sizeof(float));
+                }
+            }
+        } else if (v_tensor->type == GGML_TYPE_F16) {
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                    const ggml_fp16_t val = ggml_fp32_to_fp16(v_data[i * n_embd_head_v + j]);
+                    const uint32_t v_row = head_kv * n_embd_head_v + j;
+                    const size_t offset = v_row * v_tensor->nb[1] + cell * ggml_type_size(GGML_TYPE_F16);
+                    ggml_backend_tensor_set(v_tensor, &val, offset, ggml_type_size(GGML_TYPE_F16));
+                }
+            }
+        } else {
+            GGML_ABORT("write_v_compact: unsupported V type %s (only F32/F16)", ggml_type_name(v_tensor->type));
+        }
+    } else {
+        // V is not transposed: shape [n_embd_v_gqa, kv_size]
+        const uint32_t head_offset = head_kv * n_embd_head_v;
+        GGML_ASSERT(head_offset + n_embd_head_v <= n_embd_v_gqa);
+
+        if (v_tensor->type == GGML_TYPE_F32) {
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                const size_t offset = cell * v_tensor->nb[1] + head_offset * sizeof(float);
+                ggml_backend_tensor_set(v_tensor, v_data + i * n_embd_head_v, offset, n_embd_head_v * sizeof(float));
+            }
+        } else if (v_tensor->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n_embd_head_v);
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                    tmp[j] = ggml_fp32_to_fp16(v_data[i * n_embd_head_v + j]);
+                }
+                const size_t offset = cell * v_tensor->nb[1] + head_offset * ggml_type_size(GGML_TYPE_F16);
+                ggml_backend_tensor_set(v_tensor, tmp.data(), offset, n_embd_head_v * ggml_type_size(GGML_TYPE_F16));
+            }
+        } else {
+            GGML_ABORT("write_v_compact: unsupported V type %s (only F32/F16)", ggml_type_name(v_tensor->type));
+        }
+    }
+}
+
+ggml_tensor * llama_kv_cache::get_k_raw(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+    return layers[it->second].k;
+}
+
+ggml_tensor * llama_kv_cache::get_v_raw(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+    return layers[it->second].v;
+}
+
+bool llama_kv_cache::get_v_trans() const {
+    return v_trans;
+}
+
+uint32_t llama_kv_cache::get_used_cells(uint32_t stream) const {
+    GGML_ASSERT(stream < v_cells.size());
+    uint32_t count = 0;
+    const auto & cells = v_cells[stream];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+llama_pos llama_kv_cache::get_cell_pos(uint32_t stream, uint32_t cell_idx) const {
+    GGML_ASSERT(stream < v_cells.size());
+    return v_cells[stream].pos_get(cell_idx);
+}
+
+bool llama_kv_cache::is_cell_empty(uint32_t stream, uint32_t cell_idx) const {
+    GGML_ASSERT(stream < v_cells.size());
+    return v_cells[stream].is_empty(cell_idx);
+}
+
+void llama_kv_cache::compact_cells(const uint32_t * kept_indices, uint32_t n_kept, uint32_t stream) {
+    GGML_ASSERT(stream < v_cells.size());
+
+    auto & cells = v_cells[stream];
+    const uint32_t kv_size = cells.size();
+
+    // build a set of kept indices for fast lookup
+    std::vector<bool> is_kept(kv_size, false);
+    for (uint32_t i = 0; i < n_kept; ++i) {
+        GGML_ASSERT(kept_indices[i] < kv_size);
+        is_kept[kept_indices[i]] = true;
+    }
+
+    // mark non-kept cells as empty
+    for (uint32_t i = 0; i < kv_size; ++i) {
+        if (!cells.is_empty(i) && !is_kept[i]) {
+            cells.rm(i);
+        }
+    }
+
+    // update the head to search from the beginning
+    v_heads[stream] = 0;
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -2224,6 +2505,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::has_compaction_bias() const {
+    return kv->has_compaction_bias();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

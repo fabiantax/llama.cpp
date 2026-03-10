@@ -753,6 +753,32 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // KV cache compaction (Attention Matching)
+    //
+
+    struct llama_compact_params {
+        float    target_ratio;           // fraction of tokens to keep (0.0-1.0)
+        int32_t  n_ref_queries;          // number of reference queries (0 = auto)
+        bool     use_repeat_prefill;     // use repeat-prefill for reference queries
+        bool     use_nonuniform_budgets; // use per-head sensitivity-based budgets
+        const char * budget_profile_path; // NULL = uniform budgets
+    };
+
+    LLAMA_API struct llama_compact_params llama_compact_params_default(void);
+
+    // Compact the KV cache for a sequence using Attention Matching
+    // Reduces KV cache size while preserving attention patterns via:
+    //   1. Token selection (highest attention mass)
+    //   2. Beta bias injection (attention mass correction)
+    //   3. C_v value optimization (least-squares value correction)
+    //
+    // Returns the number of tokens after compaction, or -1 on error
+    LLAMA_API int32_t llama_kv_cache_compact(
+                 struct llama_context * ctx,
+                           llama_seq_id seq_id,
+            struct llama_compact_params params);
+
+    //
     // State / sessions
     //
 
