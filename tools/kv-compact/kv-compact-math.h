@@ -373,3 +373,257 @@ static compacted_head compact_head_highest_attn(
 
     return result;
 }
+
+// ============================================================================
+// Per-head sensitivity measurement and non-uniform budget allocation
+// ============================================================================
+
+// Compute reconstruction error (MSE) for a single head at a given compression ratio.
+// This measures how sensitive a head is to compression — higher error = more sensitive.
+//
+//   K:       [T, d_k] original keys for this head
+//   V:       [T, d_v] original values for this head
+//   Q_ref:   [n_q, d_k] reference queries
+//   t_keep:  number of tokens to keep after compaction
+//
+// Returns the mean squared error between original and compacted attention outputs
+// averaged across all reference queries.
+static float compute_head_reconstruction_error(
+        const float * K, const float * V, const float * Q_ref,
+        int T, int n_q, int d_k, int d_v, int t_keep) {
+
+    if (t_keep >= T) return 0.0f;
+    if (T <= 0 || n_q <= 0 || d_k <= 0 || d_v <= 0 || t_keep <= 0) return 0.0f;
+
+    // Run compaction
+    compacted_head result = compact_head_highest_attn(K, V, Q_ref, T, n_q, d_k, d_v, t_keep);
+
+    const float inv_sqrt_dk = 1.0f / sqrtf((float)d_k);
+
+    // Compute original attention output for all reference queries: Y_orig = softmax(Q @ K^T / sqrt(d)) @ V
+    // Compute compacted attention output: Y_comp = softmax(Q @ C_k^T / sqrt(d) + beta) @ C_v
+    // MSE = mean over queries and dimensions of (Y_orig - Y_comp)^2
+
+    // Extract C_k (selected keys)
+    std::vector<float> C_k(t_keep * d_k);
+    for (int i = 0; i < t_keep; i++) {
+        memcpy(C_k.data() + i * d_k,
+               K + result.selected_indices[i] * d_k,
+               d_k * sizeof(float));
+    }
+
+    float total_mse = 0.0f;
+
+    for (int q = 0; q < n_q; q++) {
+        const float * qi = Q_ref + q * d_k;
+
+        // Original: scores = qi @ K^T / sqrt(d)
+        std::vector<float> orig_scores(T);
+        for (int j = 0; j < T; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++) dot += qi[d] * K[j * d_k + d];
+            orig_scores[j] = dot * inv_sqrt_dk;
+        }
+        softmax_rows(orig_scores.data(), 1, T);
+
+        // Original output
+        std::vector<float> orig_out(d_v, 0.0f);
+        for (int j = 0; j < T; j++) {
+            for (int d = 0; d < d_v; d++) {
+                orig_out[d] += orig_scores[j] * V[j * d_v + d];
+            }
+        }
+
+        // Compacted: scores = qi @ C_k^T / sqrt(d) + beta
+        std::vector<float> comp_scores(t_keep);
+        for (int j = 0; j < t_keep; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < d_k; d++) dot += qi[d] * C_k[j * d_k + d];
+            comp_scores[j] = dot * inv_sqrt_dk + result.beta[j];
+        }
+        softmax_rows(comp_scores.data(), 1, t_keep);
+
+        // Compacted output with C_v
+        std::vector<float> comp_out(d_v, 0.0f);
+        for (int j = 0; j < t_keep; j++) {
+            for (int d = 0; d < d_v; d++) {
+                comp_out[d] += comp_scores[j] * result.C_v[j * d_v + d];
+            }
+        }
+
+        // Accumulate MSE
+        for (int d = 0; d < d_v; d++) {
+            float diff = comp_out[d] - orig_out[d];
+            total_mse += diff * diff;
+        }
+    }
+
+    return total_mse / (float)(n_q * d_v);
+}
+
+// Sensitivity profile for a single head: error at multiple compression ratios
+struct head_sensitivity_profile {
+    int    layer;
+    int    head;
+    float  sensitivity;                           // scalar summary (area under error curve)
+    std::vector<std::pair<float, float>> curve;   // (ratio, mse) pairs
+};
+
+// Compute sensitivity profile for a head at multiple ratios.
+// ratios: array of keep-ratios to test (e.g., {0.1, 0.2, 0.5, 0.8})
+// Returns the profile with per-ratio errors and a scalar sensitivity summary.
+static head_sensitivity_profile compute_head_sensitivity(
+        const float * K, const float * V, const float * Q_ref,
+        int T, int n_q, int d_k, int d_v,
+        int layer, int head,
+        const float * ratios, int n_ratios) {
+
+    head_sensitivity_profile prof;
+    prof.layer = layer;
+    prof.head  = head;
+    prof.curve.resize(n_ratios);
+
+    float area = 0.0f;
+    for (int r = 0; r < n_ratios; r++) {
+        int t_keep = std::max(1, (int)(T * ratios[r]));
+        float mse = compute_head_reconstruction_error(K, V, Q_ref, T, n_q, d_k, d_v, t_keep);
+        prof.curve[r] = {ratios[r], mse};
+        area += mse;  // simple sum as sensitivity proxy
+    }
+
+    prof.sensitivity = area / (float)n_ratios;
+    return prof;
+}
+
+// Budget allocation result
+struct head_budget_allocation {
+    std::vector<int> budgets;        // per-head token budgets [n_total_heads]
+    std::vector<float> weights;      // per-head sensitivity weights [n_total_heads]
+};
+
+// Allocate per-head token budgets given sensitivity scores.
+//
+// Uses proportional allocation: heads with higher sensitivity get more tokens.
+// Total tokens kept = n_tokens_total (the global budget).
+//
+//   sensitivities: [n_heads] sensitivity scores (higher = needs more budget)
+//   n_heads:       total number of (layer, head) pairs
+//   n_active:      total active tokens in the cache
+//   target_ratio:  overall compression ratio (fraction to keep)
+//   min_ratio:     minimum per-head keep ratio (floor, e.g., 0.05)
+//   max_ratio:     maximum per-head keep ratio (ceiling, e.g., 0.95)
+//
+// Returns per-head budgets (number of tokens to keep) and normalized weights.
+// The global cell budget (cells actually evicted) uses the maximum per-head budget
+// since cells are shared. Individual heads may use fewer cells than the global set.
+static head_budget_allocation allocate_head_budgets(
+        const float * sensitivities, int n_heads,
+        int n_active, float target_ratio,
+        float min_ratio = 0.02f, float max_ratio = 0.95f) {
+
+    head_budget_allocation result;
+    result.budgets.resize(n_heads);
+    result.weights.resize(n_heads);
+
+    if (n_heads <= 0 || n_active <= 0) return result;
+
+    // Compute total sensitivity
+    float total_sens = 0.0f;
+    for (int i = 0; i < n_heads; i++) {
+        total_sens += std::max(1e-12f, sensitivities[i]);
+    }
+
+    // Proportional allocation:
+    //   weight[i] = sensitivity[i] / total_sensitivity
+    //   budget[i] = n_active * (target_ratio * weight[i] * n_heads)
+    //   (scaled so that mean(budget) = n_active * target_ratio)
+    //
+    // Intuition: if all sensitivities are equal, every head gets target_ratio * n_active.
+    // More sensitive heads get proportionally more.
+
+    const float mean_budget = n_active * target_ratio;
+    const int min_budget = std::max(1, (int)(n_active * min_ratio));
+    const int max_budget = std::min(n_active, (int)(n_active * max_ratio));
+
+    // First pass: proportional allocation
+    std::vector<float> raw_budgets(n_heads);
+    for (int i = 0; i < n_heads; i++) {
+        float w = std::max(1e-12f, sensitivities[i]) / total_sens;
+        result.weights[i] = w;
+        raw_budgets[i] = mean_budget * w * n_heads;  // scale so mean = mean_budget
+    }
+
+    // Second pass: clamp and redistribute
+    // Use iterative clamping to handle min/max constraints
+    std::vector<bool> clamped(n_heads, false);
+    for (int iter = 0; iter < 10; iter++) {
+        float clamped_total = 0.0f;
+        float unclamped_total_sens = 0.0f;
+        int n_unclamped = 0;
+
+        for (int i = 0; i < n_heads; i++) {
+            if (clamped[i]) {
+                clamped_total += result.budgets[i];
+            } else {
+                unclamped_total_sens += std::max(1e-12f, sensitivities[i]);
+                n_unclamped++;
+            }
+        }
+
+        if (n_unclamped == 0) break;
+
+        float remaining = mean_budget * n_heads - clamped_total;
+        bool any_clamped = false;
+
+        for (int i = 0; i < n_heads; i++) {
+            if (clamped[i]) continue;
+
+            float w = std::max(1e-12f, sensitivities[i]) / unclamped_total_sens;
+            int b = (int)(remaining * w + 0.5f);
+            b = std::max(min_budget, std::min(max_budget, b));
+
+            if (b == min_budget || b == max_budget) {
+                result.budgets[i] = b;
+                clamped[i] = true;
+                any_clamped = true;
+            } else {
+                result.budgets[i] = b;
+            }
+        }
+
+        if (!any_clamped) break;
+    }
+
+    return result;
+}
+
+// Compute per-head sensitivity weights for global key scoring.
+// This is a lighter-weight alternative to full budget allocation:
+// instead of per-head budgets, weight each head's contribution to
+// the global importance score differently.
+//
+//   sensitivities: [n_heads] sensitivity scores
+//   n_heads:       number of heads
+//   weights_out:   [n_heads] output weights (sum to n_heads)
+//
+// More sensitive heads get higher weight in the global score,
+// so their important keys are more likely to be kept.
+static void compute_sensitivity_weights(
+        const float * sensitivities, int n_heads,
+        float * weights_out) {
+
+    if (n_heads <= 0) return;
+
+    // Use sqrt of sensitivity for softer weighting (prevents extreme ratios)
+    float total = 0.0f;
+    for (int i = 0; i < n_heads; i++) {
+        weights_out[i] = sqrtf(std::max(1e-12f, sensitivities[i]));
+        total += weights_out[i];
+    }
+
+    // Normalize so weights sum to n_heads (preserving the average)
+    float scale = (float)n_heads / (total + 1e-12f);
+    for (int i = 0; i < n_heads; i++) {
+        weights_out[i] *= scale;
+    }
+}

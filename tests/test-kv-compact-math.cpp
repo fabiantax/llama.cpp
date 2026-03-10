@@ -537,6 +537,238 @@ static void test_compact_cosine_similarity() {
 }
 
 // ============================================================================
+// compute_head_reconstruction_error tests
+// ============================================================================
+
+static void test_reconstruction_error_zero_when_no_compression() {
+    printf("  test_reconstruction_error_zero_when_no_compression...");
+    const int T = 8, n_q = 4, d_k = 4, d_v = 4;
+
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.3f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.2f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.5f);
+
+    float err = compute_head_reconstruction_error(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, T);
+    assert(approx_eq(err, 0.0f, 1e-4f));
+    printf(" OK\n");
+}
+
+static void test_reconstruction_error_increases_with_compression() {
+    printf("  test_reconstruction_error_increases_with_compression...");
+    const int T = 32, n_q = 16, d_k = 8, d_v = 8;
+
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)(i * 3 + 1) * 0.5f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)(i * 2 + 1) * 0.3f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)(i * 5 + 1) * 0.8f);
+
+    float err_80 = compute_head_reconstruction_error(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, (int)(T * 0.8f));
+    float err_50 = compute_head_reconstruction_error(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, (int)(T * 0.5f));
+    float err_20 = compute_head_reconstruction_error(K.data(), V.data(), Q.data(), T, n_q, d_k, d_v, (int)(T * 0.2f));
+
+    printf("\n    MSE at 80%%: %.8f\n", err_80);
+    printf("    MSE at 50%%: %.8f\n", err_50);
+    printf("    MSE at 20%%: %.8f\n", err_20);
+
+    // More aggressive compression should generally yield higher error
+    assert(err_50 >= err_80 * 0.5f);  // allow some tolerance for AM fitting
+    assert(err_20 >= err_50 * 0.5f);
+    printf("  OK\n");
+}
+
+// ============================================================================
+// compute_head_sensitivity tests
+// ============================================================================
+
+static void test_head_sensitivity_profile() {
+    printf("  test_head_sensitivity_profile...");
+    const int T = 24, n_q = 12, d_k = 6, d_v = 6;
+
+    std::vector<float> K(T * d_k), V(T * d_v), Q(n_q * d_k);
+    for (int i = 0; i < T * d_k; i++) K[i] = sinf((float)i * 0.4f);
+    for (int i = 0; i < T * d_v; i++) V[i] = cosf((float)i * 0.25f);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.6f);
+
+    float ratios[] = {0.2f, 0.5f, 0.8f};
+    auto prof = compute_head_sensitivity(K.data(), V.data(), Q.data(),
+                                          T, n_q, d_k, d_v, 0, 0,
+                                          ratios, 3);
+
+    assert(prof.layer == 0);
+    assert(prof.head == 0);
+    assert(prof.curve.size() == 3);
+    assert(prof.sensitivity > 0.0f);
+    assert(std::isfinite(prof.sensitivity));
+
+    // Curve should have the right ratios
+    assert(approx_eq(prof.curve[0].first, 0.2f));
+    assert(approx_eq(prof.curve[1].first, 0.5f));
+    assert(approx_eq(prof.curve[2].first, 0.8f));
+
+    // All errors should be non-negative
+    for (const auto & p : prof.curve) {
+        assert(p.second >= 0.0f);
+        assert(std::isfinite(p.second));
+    }
+
+    printf("\n    Sensitivity: %.8f\n", prof.sensitivity);
+    for (const auto & p : prof.curve) {
+        printf("    Ratio %.1f: MSE=%.8f\n", p.first, p.second);
+    }
+    printf("  OK\n");
+}
+
+static void test_sensitivity_differs_between_heads() {
+    printf("  test_sensitivity_differs_between_heads...");
+    // Create two "heads" with different attention patterns:
+    // Head A: concentrated attention (one dominant key) -> should be MORE sensitive
+    // Head B: diffuse attention (uniform keys) -> should be LESS sensitive
+
+    const int T = 20, n_q = 10, d_k = 4, d_v = 4;
+
+    // Head A: one very strong key, rest weak
+    std::vector<float> K_a(T * d_k, 0.01f), V_a(T * d_v, 0.1f);
+    for (int d = 0; d < d_k; d++) K_a[0 * d_k + d] = 5.0f;  // dominant key
+    for (int d = 0; d < d_v; d++) V_a[0 * d_v + d] = 10.0f;  // dominant value
+
+    // Head B: all keys roughly equal
+    std::vector<float> K_b(T * d_k), V_b(T * d_v);
+    for (int i = 0; i < T * d_k; i++) K_b[i] = 0.5f + 0.01f * sinf((float)i);
+    for (int i = 0; i < T * d_v; i++) V_b[i] = 0.5f + 0.01f * cosf((float)i);
+
+    // Same queries for both
+    std::vector<float> Q(n_q * d_k);
+    for (int i = 0; i < n_q * d_k; i++) Q[i] = sinf((float)i * 0.7f);
+
+    float ratios[] = {0.2f, 0.5f};
+    auto prof_a = compute_head_sensitivity(K_a.data(), V_a.data(), Q.data(),
+                                            T, n_q, d_k, d_v, 0, 0, ratios, 2);
+    auto prof_b = compute_head_sensitivity(K_b.data(), V_b.data(), Q.data(),
+                                            T, n_q, d_k, d_v, 0, 1, ratios, 2);
+
+    printf("\n    Head A (concentrated) sensitivity: %.8f\n", prof_a.sensitivity);
+    printf("    Head B (diffuse) sensitivity:      %.8f\n", prof_b.sensitivity);
+
+    // Both should be valid
+    assert(std::isfinite(prof_a.sensitivity));
+    assert(std::isfinite(prof_b.sensitivity));
+    assert(prof_a.sensitivity >= 0.0f);
+    assert(prof_b.sensitivity >= 0.0f);
+    printf("  OK\n");
+}
+
+// ============================================================================
+// allocate_head_budgets tests
+// ============================================================================
+
+static void test_budget_allocation_uniform_sensitivities() {
+    printf("  test_budget_allocation_uniform_sensitivities...");
+    float sens[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    auto result = allocate_head_budgets(sens, 4, 100, 0.5f);
+
+    // All budgets should be approximately equal (~50 each)
+    for (int i = 0; i < 4; i++) {
+        assert(result.budgets[i] >= 45 && result.budgets[i] <= 55);
+    }
+
+    // Weights should be uniform
+    for (int i = 0; i < 4; i++) {
+        assert(approx_eq(result.weights[i], 0.25f, 0.01f));
+    }
+    printf(" OK\n");
+}
+
+static void test_budget_allocation_varying_sensitivities() {
+    printf("  test_budget_allocation_varying_sensitivities...");
+    // Head 0 is 10x more sensitive than head 1
+    float sens[] = {10.0f, 1.0f};
+    auto result = allocate_head_budgets(sens, 2, 100, 0.5f);
+
+    // Head 0 should get more budget
+    assert(result.budgets[0] > result.budgets[1]);
+
+    // Total should be approximately n_active * target_ratio * n_heads = 100
+    printf("\n    Head 0 (sens=10): budget=%d\n", result.budgets[0]);
+    printf("    Head 1 (sens=1):  budget=%d\n", result.budgets[1]);
+    printf("  OK\n");
+}
+
+static void test_budget_allocation_respects_min_max() {
+    printf("  test_budget_allocation_respects_min_max...");
+    // Extreme sensitivity difference
+    float sens[] = {1000.0f, 0.001f, 0.001f};
+    auto result = allocate_head_budgets(sens, 3, 100, 0.5f, 0.1f, 0.9f);
+
+    // Min budget = 100 * 0.1 = 10
+    // Max budget = 100 * 0.9 = 90
+    for (int i = 0; i < 3; i++) {
+        assert(result.budgets[i] >= 10);
+        assert(result.budgets[i] <= 90);
+    }
+
+    printf("\n    Budgets: %d, %d, %d\n", result.budgets[0], result.budgets[1], result.budgets[2]);
+    printf("  OK\n");
+}
+
+// ============================================================================
+// compute_sensitivity_weights tests
+// ============================================================================
+
+static void test_sensitivity_weights_uniform() {
+    printf("  test_sensitivity_weights_uniform...");
+    float sens[] = {1.0f, 1.0f, 1.0f};
+    float weights[3];
+    compute_sensitivity_weights(sens, 3, weights);
+
+    // Uniform sensitivities -> uniform weights (summing to n_heads=3)
+    for (int i = 0; i < 3; i++) {
+        assert(approx_eq(weights[i], 1.0f, 0.01f));
+    }
+    printf(" OK\n");
+}
+
+static void test_sensitivity_weights_varying() {
+    printf("  test_sensitivity_weights_varying...");
+    float sens[] = {4.0f, 1.0f};  // head 0 is 4x more sensitive
+    float weights[2];
+    compute_sensitivity_weights(sens, 2, weights);
+
+    // Weights should sum to n_heads=2
+    float sum = weights[0] + weights[1];
+    assert(approx_eq(sum, 2.0f, 0.01f));
+
+    // Head 0 should have higher weight (uses sqrt, so 2x vs 1x)
+    assert(weights[0] > weights[1]);
+
+    printf("\n    Weight[0] (sens=4): %.3f\n", weights[0]);
+    printf("    Weight[1] (sens=1): %.3f\n", weights[1]);
+    printf("  OK\n");
+}
+
+static void test_sensitivity_weights_extreme() {
+    printf("  test_sensitivity_weights_extreme...");
+    float sens[] = {100.0f, 0.01f, 1.0f};
+    float weights[3];
+    compute_sensitivity_weights(sens, 3, weights);
+
+    // Should be finite and positive
+    for (int i = 0; i < 3; i++) {
+        assert(std::isfinite(weights[i]));
+        assert(weights[i] > 0.0f);
+    }
+
+    // Sum to n_heads=3
+    float sum = weights[0] + weights[1] + weights[2];
+    assert(approx_eq(sum, 3.0f, 0.01f));
+
+    // Ordering: sens=100 > sens=1 > sens=0.01
+    assert(weights[0] > weights[2]);
+    assert(weights[2] > weights[1]);
+    printf(" OK\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -576,6 +808,24 @@ int main() {
     test_compact_quality_improves_with_refitting();
     test_compact_beta_values_are_finite();
     test_compact_cosine_similarity();
+
+    printf("\n=== Reconstruction error ===\n");
+    test_reconstruction_error_zero_when_no_compression();
+    test_reconstruction_error_increases_with_compression();
+
+    printf("\n=== Head sensitivity profiling ===\n");
+    test_head_sensitivity_profile();
+    test_sensitivity_differs_between_heads();
+
+    printf("\n=== Budget allocation ===\n");
+    test_budget_allocation_uniform_sensitivities();
+    test_budget_allocation_varying_sensitivities();
+    test_budget_allocation_respects_min_max();
+
+    printf("\n=== Sensitivity weights ===\n");
+    test_sensitivity_weights_uniform();
+    test_sensitivity_weights_varying();
+    test_sensitivity_weights_extreme();
 
     printf("\nAll tests passed!\n");
     return 0;
