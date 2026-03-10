@@ -255,6 +255,29 @@ public:
     // check if cell is empty
     bool is_cell_empty(uint32_t stream, uint32_t cell_idx) const;
 
+    //
+    // Q capture API (for repeat-prefill reference queries)
+    //
+
+    // enable/disable Q vector capture during decode
+    void set_q_capture(bool enable);
+    bool get_q_capture() const;
+
+    // store captured Q vectors for a model layer
+    // q_data: [n_tokens, n_head, n_embd_head_k] in F32
+    void store_captured_q(int32_t il, const float * q_data, uint32_t n_tokens, uint32_t n_head, uint32_t n_embd_head);
+
+    // check if captured Q vectors are available for a model layer
+    bool has_captured_q(int32_t il) const;
+
+    // get captured Q vectors for a model layer
+    // returns pointer to [n_q, n_embd_head_k] data (one KV head's worth, GQA-collapsed)
+    // n_q is returned via out_n_q
+    const float * get_captured_q(int32_t il, uint32_t head_kv, uint32_t * out_n_q) const;
+
+    // clear all captured Q vectors
+    void clear_captured_q();
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -313,6 +336,18 @@ private:
     // values are added to attention scores (pre-softmax) for compacted keys
     std::vector<std::vector<float>> compaction_bias;
     bool compaction_bias_active = false; // fast check to skip bias logic when no biases set
+
+    // Q capture storage (CPU-side)
+    // when q_capture_active is true, Q vectors are captured during decode via eval callback
+    // indexed as: captured_q[kv_layer_id] = flat array of [n_tokens * n_head * n_embd_head_k]
+    bool q_capture_enabled = false;
+    struct captured_q_layer {
+        std::vector<float> data;   // [n_tokens * n_head * n_embd_head_k]
+        uint32_t n_tokens   = 0;
+        uint32_t n_head     = 0;   // query heads (not KV heads)
+        uint32_t n_embd_head = 0;
+    };
+    std::vector<captured_q_layer> captured_q;
 
     size_t total_size() const;
 

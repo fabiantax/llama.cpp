@@ -778,6 +778,13 @@ extern "C" {
                            llama_seq_id seq_id,
             struct llama_compact_params params);
 
+    // Enable/disable Q vector capture during decode for repeat-prefill compaction
+    // When enabled, Q vectors at each layer are captured during llama_decode()
+    // and used as reference queries for subsequent llama_kv_cache_compact() calls
+    LLAMA_API void llama_kv_cache_capture_q(
+            struct llama_context * ctx,
+                              bool enable);
+
     //
     // State / sessions
     //

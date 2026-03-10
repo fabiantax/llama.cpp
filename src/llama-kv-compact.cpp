@@ -154,8 +154,9 @@ int32_t llama_kv_compact_impl(
 
     const uint32_t n_keep = std::max(1u, (uint32_t)(n_active * target_ratio));
 
-    LLAMA_LOG_INFO("%s: compacting KV cache: %u -> %u tokens (ratio %.2f)\n",
-                   __func__, n_active, n_keep, target_ratio);
+    LLAMA_LOG_INFO("%s: compacting KV cache: %u -> %u tokens (ratio %.2f, Q source: %s)\n",
+                   __func__, n_active, n_keep, target_ratio,
+                   (params.use_repeat_prefill && kv->has_captured_q(0)) ? "captured" : "K-proxy");
 
     if (n_keep >= n_active) {
         LLAMA_LOG_INFO("%s: n_keep >= n_active, nothing to compact\n", __func__);
@@ -167,9 +168,14 @@ int32_t llama_kv_compact_impl(
     const uint32_t n_layer       = hparams.n_layer;
     const bool     v_trans       = kv->get_v_trans();
 
-    // for reference queries, use K vectors as proxy (simplified)
-    // TODO: implement true repeat-prefill query generation (US-4)
-    const int n_ref_q = params.n_ref_queries > 0 ? params.n_ref_queries : std::min((int)n_active, 64);
+    // determine reference query source
+    const bool use_captured_q = params.use_repeat_prefill && kv->has_captured_q(0);
+    if (params.use_repeat_prefill && !use_captured_q) {
+        LLAMA_LOG_WARN("%s: repeat-prefill requested but no captured Q vectors available, falling back to K-proxy\n", __func__);
+    }
+
+    // n_ref_q is per-head and may vary when using captured Q; set default for K-proxy mode
+    const int n_ref_q_default = params.n_ref_queries > 0 ? params.n_ref_queries : std::min((int)n_active, 64);
 
     // clear any existing bias
     kv->clear_compaction_bias();
@@ -222,14 +228,26 @@ int32_t llama_kv_compact_impl(
                 }
             }
 
-            // use K vectors as reference queries (simplified proxy)
-            // select n_ref_q evenly spaced keys as reference queries
-            std::vector<float> Q_ref(n_ref_q * n_embd_head_k);
-            for (int q = 0; q < n_ref_q; ++q) {
-                int src = (int)(q * (n_active - 1) / (n_ref_q - 1 + 1e-9f));
-                memcpy(Q_ref.data() + q * n_embd_head_k,
-                       K_data.data() + src * n_embd_head_k,
-                       n_embd_head_k * sizeof(float));
+            // get reference queries: captured Q vectors or K-proxy fallback
+            int n_ref_q;
+            std::vector<float> Q_ref;
+
+            if (use_captured_q && kv->has_captured_q(il)) {
+                // use real Q vectors captured during decode
+                uint32_t n_captured = 0;
+                const float * captured = kv->get_captured_q(il, h, &n_captured);
+                n_ref_q = (int)n_captured;
+                Q_ref.assign(captured, captured + n_ref_q * n_embd_head_k);
+            } else {
+                // fallback: use K vectors as proxy
+                n_ref_q = n_ref_q_default;
+                Q_ref.resize(n_ref_q * n_embd_head_k);
+                for (int q = 0; q < n_ref_q; ++q) {
+                    int src_idx = (int)(q * (n_active - 1) / (n_ref_q - 1 + 1e-9f));
+                    memcpy(Q_ref.data() + q * n_embd_head_k,
+                           K_data.data() + src_idx * n_embd_head_k,
+                           n_embd_head_k * sizeof(float));
+                }
             }
 
             // compute attention scores and key importance
@@ -297,21 +315,32 @@ int32_t llama_kv_compact_impl(
                 read_v_head(v_tensor, h, n_embd_head_v, n_embd_v_gqa, n_active, kv_size, v_trans, V_all);
             }
 
-            // generate reference queries from K vectors (proxy)
-            std::vector<float> Q_ref(n_ref_q * n_embd_head_k);
-            for (int q = 0; q < n_ref_q; ++q) {
-                int src = (int)(q * (n_active - 1) / (n_ref_q - 1 + 1e-9f));
-                memcpy(Q_ref.data() + q * n_embd_head_k,
-                       K_all.data() + src * n_embd_head_k,
-                       n_embd_head_k * sizeof(float));
+            // get reference queries for AM fitting
+            int n_ref_q_am;
+            std::vector<float> Q_ref_am;
+
+            if (use_captured_q && kv->has_captured_q(il)) {
+                uint32_t n_captured = 0;
+                const float * captured = kv->get_captured_q(il, h, &n_captured);
+                n_ref_q_am = (int)n_captured;
+                Q_ref_am.assign(captured, captured + n_ref_q_am * n_embd_head_k);
+            } else {
+                n_ref_q_am = n_ref_q_default;
+                Q_ref_am.resize(n_ref_q_am * n_embd_head_k);
+                for (int q = 0; q < n_ref_q_am; ++q) {
+                    int src_idx = (int)(q * (n_active - 1) / (n_ref_q_am - 1 + 1e-9f));
+                    memcpy(Q_ref_am.data() + q * n_embd_head_k,
+                           K_all.data() + src_idx * n_embd_head_k,
+                           n_embd_head_k * sizeof(float));
+                }
             }
 
             // run full AM compaction on this head
             compacted_head result = compact_head_highest_attn(
                 K_all.data(),
                 V_all.empty() ? nullptr : V_all.data(),
-                Q_ref.data(),
-                n_active, n_ref_q, n_embd_head_k,
+                Q_ref_am.data(),
+                n_active, n_ref_q_am, n_embd_head_k,
                 v_tensor ? n_embd_head_v : 0,
                 n_keep);
 

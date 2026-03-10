@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-kv-compact.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -1068,6 +1069,14 @@ bool llama_context::set_adapter_cvec(
     return cvec->apply(model, data, len, n_embd, il_start, il_end);
 }
 
+// Q capture eval callback infrastructure (used by process_ubatch when Q capture is enabled)
+struct q_capture_context {
+    llama_kv_cache * kv;
+    ggml_backend_sched_eval_callback user_cb;
+    void * user_cb_data;
+};
+static bool q_capture_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1090,7 +1099,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        // determine eval callback: wrap with Q capture if enabled
+        {
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (kv && kv->get_q_capture()) {
+                static thread_local q_capture_context qctx;
+                qctx.kv           = kv;
+                qctx.user_cb      = cparams.cb_eval;
+                qctx.user_cb_data = cparams.cb_eval_user_data;
+                ggml_backend_sched_set_eval_callback(sched.get(), q_capture_eval_callback, &qctx);
+            } else {
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            }
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3186,6 +3208,93 @@ int32_t llama_kv_cache_compact(
                        llama_seq_id seq_id,
         struct llama_compact_params params) {
     return llama_kv_compact_impl(ctx, seq_id, params);
+}
+
+static bool q_capture_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * qctx = static_cast<q_capture_context *>(user_data);
+
+    // check if this is a Qcur tensor (named "Qcur-{layer}")
+    const char * name = t->name;
+    bool is_qcur = (strncmp(name, "Qcur-", 5) == 0);
+
+    // also handle backend-prefixed names like "CUDA0#Qcur-0#0"
+    if (!is_qcur) {
+        const char * hash = strchr(name, '#');
+        if (hash) {
+            is_qcur = (strncmp(hash + 1, "Qcur-", 5) == 0);
+            if (is_qcur) {
+                name = hash + 1; // point to "Qcur-..."
+            }
+        }
+    }
+
+    if (ask) {
+        // we want data from Qcur tensors
+        if (is_qcur) return true;
+        // chain to user callback
+        if (qctx->user_cb) return qctx->user_cb(t, ask, qctx->user_cb_data);
+        return false;
+    }
+
+    // data pass (ask == false)
+    if (is_qcur) {
+        // parse layer index from name "Qcur-{il}"
+        const char * dash = strchr(name, '-');
+        if (dash) {
+            int il = atoi(dash + 1);
+
+            // Q tensor shape: [n_embd_head, n_head, n_tokens] (ggml layout)
+            // ne[0] = n_embd_head, ne[1] = n_head, ne[2] = n_tokens
+            const uint32_t n_embd_head = t->ne[0];
+            const uint32_t n_head      = t->ne[1];
+            const uint32_t n_tokens    = t->ne[2];
+
+            // read tensor data to CPU
+            const size_t nbytes = ggml_nbytes(t);
+            std::vector<float> q_data(n_tokens * n_head * n_embd_head);
+
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, q_data.data(), 0, nbytes);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_tokens * n_head * n_embd_head);
+                ggml_backend_tensor_get(t, tmp.data(), 0, nbytes);
+                for (size_t i = 0; i < tmp.size(); ++i) {
+                    q_data[i] = ggml_fp16_to_fp32(tmp[i]);
+                }
+            } else {
+                // for other types, dequantize
+                std::vector<uint8_t> raw(nbytes);
+                ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
+                ggml_get_type_traits(t->type)->to_float(raw.data(), q_data.data(),
+                    n_tokens * n_head * n_embd_head);
+            }
+
+            // ggml tensor is [n_embd_head, n_head, n_tokens] but we need row-major
+            // [n_tokens, n_head, n_embd_head] for storage
+            // the data from ggml_backend_tensor_get is contiguous in ggml order:
+            // fastest dim = ne[0] = n_embd_head, then ne[1] = n_head, then ne[2] = n_tokens
+            // so it's already: for each token, for each head, n_embd_head floats
+            // which is [n_tokens][n_head][n_embd_head] in row-major — exactly what we want
+
+            qctx->kv->store_captured_q(il, q_data.data(), n_tokens, n_head, n_embd_head);
+        }
+    }
+
+    // chain to user callback
+    if (qctx->user_cb) return qctx->user_cb(t, ask, qctx->user_cb_data);
+    return true;
+}
+
+void llama_kv_cache_capture_q(
+        struct llama_context * ctx,
+                          bool enable) {
+    auto * memory = ctx->get_memory();
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: memory type is not llama_kv_cache\n", __func__);
+        return;
+    }
+    kv->set_q_capture(enable);
 }
 
 // llama state API

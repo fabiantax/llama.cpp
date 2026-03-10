@@ -1792,6 +1792,96 @@ void llama_kv_cache::compact_cells(const uint32_t * kept_indices, uint32_t n_kep
     v_heads[stream] = 0;
 }
 
+// ============================================================================
+// Q capture implementation
+// ============================================================================
+
+void llama_kv_cache::set_q_capture(bool enable) {
+    q_capture_enabled = enable;
+    if (!enable) {
+        clear_captured_q();
+    }
+}
+
+bool llama_kv_cache::get_q_capture() const {
+    return q_capture_enabled;
+}
+
+void llama_kv_cache::store_captured_q(int32_t il, const float * q_data,
+                                       uint32_t n_tokens, uint32_t n_head, uint32_t n_embd_head) {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return; // layer not in KV cache (e.g. no KV for this layer)
+    }
+    const int32_t kv_layer_id = it->second;
+
+    // lazy init
+    if (captured_q.empty()) {
+        captured_q.resize(layers.size());
+    }
+
+    auto & cq = captured_q[kv_layer_id];
+    const size_t total = (size_t)n_tokens * n_head * n_embd_head;
+    cq.data.resize(total);
+    memcpy(cq.data.data(), q_data, total * sizeof(float));
+    cq.n_tokens    = n_tokens;
+    cq.n_head      = n_head;
+    cq.n_embd_head = n_embd_head;
+}
+
+bool llama_kv_cache::has_captured_q(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return false;
+    if (captured_q.empty()) return false;
+    const int32_t kv_layer_id = it->second;
+    return kv_layer_id < (int32_t)captured_q.size() && captured_q[kv_layer_id].n_tokens > 0;
+}
+
+const float * llama_kv_cache::get_captured_q(int32_t il, uint32_t head_kv, uint32_t * out_n_q) const {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+    const int32_t kv_layer_id = it->second;
+    GGML_ASSERT(kv_layer_id < (int32_t)captured_q.size());
+
+    const auto & cq = captured_q[kv_layer_id];
+    GGML_ASSERT(cq.n_tokens > 0);
+
+    // Q tensor is [n_tokens, n_head, n_embd_head] (row-major)
+    // For GQA: multiple query heads map to one KV head
+    // We return all query head vectors that map to this KV head
+    const uint32_t n_head_kv_l = hparams.n_head_kv(layers[kv_layer_id].il);
+    const uint32_t gqa_ratio   = cq.n_head / n_head_kv_l;
+    const uint32_t q_head_start = head_kv * gqa_ratio;
+    const uint32_t n_q_per_head = cq.n_tokens * gqa_ratio;
+
+    // Flatten: for each token, extract the gqa_ratio query heads belonging to this KV head
+    // Result: [n_tokens * gqa_ratio, n_embd_head]
+    // We use a thread-local buffer to avoid allocation per call
+    thread_local std::vector<float> q_buf;
+    q_buf.resize(n_q_per_head * cq.n_embd_head);
+
+    for (uint32_t t = 0; t < cq.n_tokens; ++t) {
+        for (uint32_t g = 0; g < gqa_ratio; ++g) {
+            const uint32_t src_head = q_head_start + g;
+            const float * src = cq.data.data() + (t * cq.n_head + src_head) * cq.n_embd_head;
+            float * dst = q_buf.data() + (t * gqa_ratio + g) * cq.n_embd_head;
+            memcpy(dst, src, cq.n_embd_head * sizeof(float));
+        }
+    }
+
+    *out_n_q = n_q_per_head;
+    return q_buf.data();
+}
+
+void llama_kv_cache::clear_captured_q() {
+    for (auto & cq : captured_q) {
+        cq.data.clear();
+        cq.n_tokens = 0;
+        cq.n_head = 0;
+        cq.n_embd_head = 0;
+    }
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
