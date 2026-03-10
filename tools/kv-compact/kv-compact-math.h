@@ -145,7 +145,30 @@ static void nnls_solve(const float * A, const float * b, float * w, int m, int n
 // Uses Cholesky-like approach: x = (A^T A)^{-1} A^T b
 // For simplicity, uses pseudo-inverse via regularized normal equations
 static void least_squares_solve(const float * A, const float * b, float * x,
-                                int m, int n, int p, float ridge = 1e-6f) {
+                                int m, int n, int p, float ridge = 0.0f) {
+    // Auto-scale ridge when underdetermined (m < n): use larger regularization
+    // to prevent unstable solutions. Scale by the Frobenius norm of A^T*A diagonal.
+    if (ridge <= 0.0f) {
+        // Compute average diagonal of A^T*A as scale reference
+        float diag_sum = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float sum = 0.0f;
+            for (int k = 0; k < m; k++) {
+                sum += A[k * n + i] * A[k * n + i];
+            }
+            diag_sum += sum;
+        }
+        float avg_diag = diag_sum / std::max(n, 1);
+
+        // Underdetermined: strong regularization to keep solution close to zero
+        // Well-determined: light regularization for numerical stability
+        if (m < n) {
+            ridge = avg_diag * 1.0f;  // strong: equivalent to equal prior weight
+        } else {
+            ridge = avg_diag * 1e-4f; // light: just numerical stabilization
+        }
+        ridge = std::max(ridge, 1e-6f);
+    }
     // Compute AtA = A^T * A  (n x n)
     std::vector<float> AtA(n * n, 0.0f);
     for (int i = 0; i < n; i++) {
@@ -340,15 +363,10 @@ static compacted_head compact_head_highest_attn(
         result.beta[j] = logf(std::max(1e-12f, w[j]));
     }
 
-    // Step 3: Solve least squares for C_v (value fitting)
-    //   We want: softmax(q * C_k^T + beta) * C_v ≈ softmax(q * K^T) * V
-    //
-    //   X_ij = softmax(q_i * C_k_j + beta_j) (compacted attention weights)
-    //   Y_i  = softmax(q_i * K^T) * V         (original attention output)
-    //   Solve: X * C_v = Y
+    // Step 3: Solve regularized least squares for C_v (value fitting)
+    //   min_C ||X*C - Y||^2 + lambda * ||C - V_selected||^2
+    //   Regularized toward original V to prevent instability when underdetermined
 
-    // Compute X: attention weights with compacted keys + bias
-    // scores[] are already scaled by inv_sqrt_dk (line 286), so just add beta
     std::vector<float> X(n_q * t);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < t; j++) {
@@ -357,7 +375,6 @@ static compacted_head compact_head_highest_attn(
     }
     softmax_rows(X.data(), n_q, t);
 
-    // Compute Y: original attention output = attn_weights @ V  [n_q, d_v]
     std::vector<float> Y(n_q * d_v, 0.0f);
     for (int i = 0; i < n_q; i++) {
         for (int j = 0; j < T; j++) {
@@ -368,8 +385,151 @@ static compacted_head compact_head_highest_attn(
         }
     }
 
-    // Solve: X * C_v = Y  =>  C_v = (X^T X)^{-1} X^T Y
-    least_squares_solve(X.data(), Y.data(), result.C_v.data(), n_q, t, d_v);
+    // Regularization: strong when underdetermined, light when well-determined
+    float lambda = (n_q >= t) ? 0.01f : 1.0f;
+    float sqrt_lambda = sqrtf(lambda);
+
+    int m_aug = n_q + t;
+    std::vector<float> X_aug(m_aug * t, 0.0f);
+    std::vector<float> Y_aug(m_aug * d_v, 0.0f);
+
+    for (int i = 0; i < n_q; i++) {
+        for (int j = 0; j < t; j++) {
+            X_aug[i * t + j] = X[i * t + j];
+        }
+        for (int d = 0; d < d_v; d++) {
+            Y_aug[i * d_v + d] = Y[i * d_v + d];
+        }
+    }
+
+    for (int j = 0; j < t; j++) {
+        X_aug[(n_q + j) * t + j] = sqrt_lambda;
+        for (int d = 0; d < d_v; d++) {
+            Y_aug[(n_q + j) * d_v + d] = sqrt_lambda * V[selected[j] * d_v + d];
+        }
+    }
+
+    least_squares_solve(X_aug.data(), Y_aug.data(), result.C_v.data(), m_aug, t, d_v);
+
+    return result;
+}
+
+// Fit beta and C_v for a pre-selected set of key indices (no key selection step).
+// This is used when global key selection has already been done and we just need
+// per-head NNLS beta + least-squares C_v fitting.
+//
+//   K:       [T, d_k] original keys for this head
+//   V:       [T, d_v] original values for this head (can be nullptr to skip C_v)
+//   Q_ref:   [n_q, d_k] reference queries
+//   selected: [t] pre-selected indices into the K/V arrays
+//   T:       total number of original tokens
+//   n_q:     number of reference queries
+//   d_k, d_v: key and value dimensions
+//   t:       number of selected tokens
+//
+// Returns compacted_head with selected_indices=selected, beta, and C_v
+static compacted_head fit_head_for_selection(
+        const float * K, const float * V, const float * Q_ref,
+        const int * selected, int T, int n_q, int d_k, int d_v, int t) {
+
+    compacted_head result;
+    result.selected_indices.assign(selected, selected + t);
+    result.beta.resize(t);
+    result.C_v.resize(t * d_v);
+
+    if (t >= T) {
+        std::fill(result.beta.begin(), result.beta.end(), 0.0f);
+        if (V) memcpy(result.C_v.data(), V, T * d_v * sizeof(float));
+        return result;
+    }
+
+    // Step 1: Compute attention scores Q_ref @ K^T / sqrt(d_k)
+    const float inv_sqrt_dk = 1.0f / sqrtf((float) d_k);
+    std::vector<float> scores(n_q * T);
+    mat_mul_ABt(Q_ref, K, scores.data(), n_q, T, d_k);
+    for (int i = 0; i < n_q * T; i++) {
+        scores[i] *= inv_sqrt_dk;
+    }
+
+    // Compute exp(scores) with max-shift for mass computation
+    std::vector<float> exp_scores(scores);
+    std::vector<float> row_sums(n_q);
+    exp_rows_stable(exp_scores.data(), row_sums.data(), n_q, T);
+
+    // Compute softmax attention weights for original output
+    std::vector<float> attn_weights(scores);
+    softmax_rows(attn_weights.data(), n_q, T);
+
+    // Step 2: Solve NNLS for beta
+    std::vector<float> M(n_q * t);
+    for (int i = 0; i < n_q; i++) {
+        for (int j = 0; j < t; j++) {
+            M[i * t + j] = exp_scores[i * T + selected[j]];
+        }
+    }
+
+    std::vector<float> w(t);
+    nnls_solve(M.data(), row_sums.data(), w.data(), n_q, t);
+
+    for (int j = 0; j < t; j++) {
+        result.beta[j] = logf(std::max(1e-12f, w[j]));
+    }
+
+    // Step 3: Solve regularized least squares for C_v
+    // We solve: min_C ||X*C - Y||^2 + lambda * ||C - V_selected||^2
+    // This regularizes toward the original V values, preventing unstable solutions
+    // when the system is underdetermined (n_q < t).
+    //
+    // Rewritten as: min_C ||[X; sqrt(lambda)*I] * C - [Y; sqrt(lambda)*V_sel]||^2
+    if (V && d_v > 0) {
+        std::vector<float> X(n_q * t);
+        for (int i = 0; i < n_q; i++) {
+            for (int j = 0; j < t; j++) {
+                X[i * t + j] = scores[i * T + selected[j]] + result.beta[j];
+            }
+        }
+        softmax_rows(X.data(), n_q, t);
+
+        std::vector<float> Y(n_q * d_v, 0.0f);
+        for (int i = 0; i < n_q; i++) {
+            for (int j = 0; j < T; j++) {
+                float w_ij = attn_weights[i * T + j];
+                for (int d = 0; d < d_v; d++) {
+                    Y[i * d_v + d] += w_ij * V[j * d_v + d];
+                }
+            }
+        }
+
+        // Regularization strength: scale based on system conditioning
+        // When n_q >= t, light regularization; when n_q < t, strong toward V_selected
+        float lambda = (n_q >= t) ? 0.01f : 1.0f;
+        float sqrt_lambda = sqrtf(lambda);
+
+        // Build augmented system: [X; sqrt(lambda)*I] and [Y; sqrt(lambda)*V_sel]
+        int m_aug = n_q + t;
+        std::vector<float> X_aug(m_aug * t, 0.0f);
+        std::vector<float> Y_aug(m_aug * d_v, 0.0f);
+
+        // Copy X and Y into top portion
+        for (int i = 0; i < n_q; i++) {
+            for (int j = 0; j < t; j++) {
+                X_aug[i * t + j] = X[i * t + j];
+            }
+            for (int d = 0; d < d_v; d++) {
+                Y_aug[i * d_v + d] = Y[i * d_v + d];
+            }
+        }
+
+        // Add sqrt(lambda)*I and sqrt(lambda)*V_selected in bottom portion
+        for (int j = 0; j < t; j++) {
+            X_aug[(n_q + j) * t + j] = sqrt_lambda;
+            for (int d = 0; d < d_v; d++) {
+                Y_aug[(n_q + j) * d_v + d] = sqrt_lambda * V[selected[j] * d_v + d];
+            }
+        }
+
+        least_squares_solve(X_aug.data(), Y_aug.data(), result.C_v.data(), m_aug, t, d_v);
+    }
 
     return result;
 }

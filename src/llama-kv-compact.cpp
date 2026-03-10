@@ -28,80 +28,6 @@
 #include "../tools/kv-compact/kv-compact-math.h"
 
 // ============================================================================
-// K/V data extraction helpers (read from ggml tensors)
-// ============================================================================
-
-static void read_k_head(const ggml_tensor * k_tensor, int head_idx, int n_embd_head_k,
-                        int n_embd_k_gqa, int n_tokens, std::vector<float> & out) {
-    out.resize(n_tokens * n_embd_head_k);
-
-    const int head_offset = head_idx * n_embd_head_k;
-    const size_t row_size = ggml_row_size(k_tensor->type, n_embd_k_gqa);
-
-    if (k_tensor->type == GGML_TYPE_F32) {
-        for (int i = 0; i < n_tokens; i++) {
-            ggml_backend_tensor_get(k_tensor, out.data() + i * n_embd_head_k,
-                                     i * row_size + head_offset * sizeof(float),
-                                     n_embd_head_k * sizeof(float));
-        }
-    } else if (k_tensor->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n_embd_head_k);
-        for (int i = 0; i < n_tokens; i++) {
-            ggml_backend_tensor_get(k_tensor, tmp.data(),
-                                     i * row_size + head_offset * sizeof(ggml_fp16_t),
-                                     n_embd_head_k * sizeof(ggml_fp16_t));
-            for (int j = 0; j < n_embd_head_k; j++) {
-                out[i * n_embd_head_k + j] = ggml_fp16_to_fp32(tmp[j]);
-            }
-        }
-    } else {
-        std::vector<float> full_row(n_embd_k_gqa);
-        for (int i = 0; i < n_tokens; i++) {
-            std::vector<uint8_t> raw(row_size);
-            ggml_backend_tensor_get(k_tensor, raw.data(), i * row_size, row_size);
-            ggml_get_type_traits(k_tensor->type)->to_float(raw.data(), full_row.data(), n_embd_k_gqa);
-            memcpy(out.data() + i * n_embd_head_k, full_row.data() + head_offset, n_embd_head_k * sizeof(float));
-        }
-    }
-}
-
-static void read_v_head(const ggml_tensor * v_tensor, int head_idx, int n_embd_head_v,
-                        int n_embd_v_gqa, int n_tokens, int kv_size, bool v_trans,
-                        std::vector<float> & out) {
-    out.resize(n_tokens * n_embd_head_v);
-
-    if (!v_trans) {
-        read_k_head(v_tensor, head_idx, n_embd_head_v, n_embd_v_gqa, n_tokens, out);
-        return;
-    }
-
-    // V is transposed
-    if (v_tensor->type == GGML_TYPE_F32) {
-        for (int d = 0; d < n_embd_head_v; d++) {
-            for (int t = 0; t < n_tokens; t++) {
-                float val;
-                size_t offset = ((size_t)(head_idx * n_embd_head_v + d) * kv_size + t) * sizeof(float);
-                ggml_backend_tensor_get(v_tensor, &val, offset, sizeof(float));
-                out[t * n_embd_head_v + d] = val;
-            }
-        }
-    } else if (v_tensor->type == GGML_TYPE_F16) {
-        for (int d = 0; d < n_embd_head_v; d++) {
-            for (int t = 0; t < n_tokens; t++) {
-                ggml_fp16_t val;
-                size_t offset = ((size_t)(head_idx * n_embd_head_v + d) * kv_size + t) * sizeof(ggml_fp16_t);
-                ggml_backend_tensor_get(v_tensor, &val, offset, sizeof(ggml_fp16_t));
-                out[t * n_embd_head_v + d] = ggml_fp16_to_fp32(val);
-            }
-        }
-    } else {
-        LLAMA_LOG_ERROR("%s: unsupported V tensor type for transposed read: %s\n",
-                        __func__, ggml_type_name(v_tensor->type));
-        std::fill(out.begin(), out.end(), 0.0f);
-    }
-}
-
-// ============================================================================
 // Main compaction implementation
 // ============================================================================
 
@@ -378,8 +304,12 @@ int32_t llama_kv_compact_impl(
         kept_cells[i] = active_cells[kept_active[i]];
     }
 
-    // now for each layer/head, run full AM: compute beta and C_v for the kept positions
-    // Reuse cached K and Q_ref data from the scoring pass above
+    // Convert kept_active indices to int for fit_head_for_selection
+    std::vector<int> kept_active_int(kept_active.begin(), kept_active.end());
+
+    // Now for each layer/head, fit beta and C_v for the globally pre-selected key positions.
+    // We use fit_head_for_selection (not compact_head_highest_attn) because key selection
+    // was already done globally above — we just need per-head NNLS + LSQ fitting.
     gh = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (!hparams.has_kv(il)) {
@@ -400,37 +330,96 @@ int32_t llama_kv_compact_impl(
             const float * Q_ref_am = hd.Q_ref.data();
             int n_ref_q_am = hd.n_ref_q;
 
-            // Read V data (not cached in scoring pass)
+            // Read V data for active cells (using active_cells indices, not sequential)
             std::vector<float> V_all;
             if (v_tensor) {
-                read_v_head(v_tensor, h, n_embd_head_v, n_embd_v_gqa, n_active, kv_size, v_trans, V_all);
+                V_all.resize(n_active * n_embd_head_v);
+                const uint32_t head_offset_v = h * n_embd_head_v;
+
+                if (!v_trans) {
+                    // V layout: [n_embd_v_gqa, kv_size] — same as K, read per active cell
+                    for (uint32_t i = 0; i < n_active; ++i) {
+                        const size_t row_size = ggml_row_size(v_tensor->type, n_embd_v_gqa);
+
+                        if (v_tensor->type == GGML_TYPE_F32) {
+                            ggml_backend_tensor_get(v_tensor, V_all.data() + i * n_embd_head_v,
+                                                     active_cells[i] * row_size + head_offset_v * sizeof(float),
+                                                     n_embd_head_v * sizeof(float));
+                        } else if (v_tensor->type == GGML_TYPE_F16) {
+                            std::vector<ggml_fp16_t> tmp(n_embd_head_v);
+                            ggml_backend_tensor_get(v_tensor, tmp.data(),
+                                                     active_cells[i] * row_size + head_offset_v * sizeof(ggml_fp16_t),
+                                                     n_embd_head_v * sizeof(ggml_fp16_t));
+                            for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                                V_all[i * n_embd_head_v + j] = ggml_fp16_to_fp32(tmp[j]);
+                            }
+                        } else {
+                            std::vector<float> full_row(n_embd_v_gqa);
+                            std::vector<uint8_t> raw(row_size);
+                            ggml_backend_tensor_get(v_tensor, raw.data(), active_cells[i] * row_size, row_size);
+                            ggml_get_type_traits(v_tensor->type)->to_float(raw.data(), full_row.data(), n_embd_v_gqa);
+                            memcpy(V_all.data() + i * n_embd_head_v, full_row.data() + head_offset_v,
+                                   n_embd_head_v * sizeof(float));
+                        }
+                    }
+                } else {
+                    // V is transposed: layout [kv_size, n_embd_v_gqa]
+                    // For head h, dim d: offset = (h * n_embd_head_v + d) * kv_size + cell_idx
+                    if (v_tensor->type == GGML_TYPE_F32) {
+                        for (uint32_t d = 0; d < n_embd_head_v; d++) {
+                            for (uint32_t i = 0; i < n_active; i++) {
+                                float val;
+                                size_t offset = ((size_t)(h * n_embd_head_v + d) * kv_size + active_cells[i]) * sizeof(float);
+                                ggml_backend_tensor_get(v_tensor, &val, offset, sizeof(float));
+                                V_all[i * n_embd_head_v + d] = val;
+                            }
+                        }
+                    } else if (v_tensor->type == GGML_TYPE_F16) {
+                        for (uint32_t d = 0; d < n_embd_head_v; d++) {
+                            for (uint32_t i = 0; i < n_active; i++) {
+                                ggml_fp16_t val;
+                                size_t offset = ((size_t)(h * n_embd_head_v + d) * kv_size + active_cells[i]) * sizeof(ggml_fp16_t);
+                                ggml_backend_tensor_get(v_tensor, &val, offset, sizeof(ggml_fp16_t));
+                                V_all[i * n_embd_head_v + d] = ggml_fp16_to_fp32(val);
+                            }
+                        }
+                    } else {
+                        LLAMA_LOG_ERROR("%s: unsupported V tensor type for transposed read: %s\n",
+                                        __func__, ggml_type_name(v_tensor->type));
+                        std::fill(V_all.begin(), V_all.end(), 0.0f);
+                    }
+                }
             }
 
-            // run full AM compaction on this head
-            compacted_head result = compact_head_highest_attn(
+            // Fit beta and C_v for the globally pre-selected key positions
+            // kept_active_int contains indices into the K_all/V_all arrays (0..n_active-1)
+            compacted_head result = fit_head_for_selection(
                 K_all,
                 V_all.empty() ? nullptr : V_all.data(),
                 Q_ref_am,
+                kept_active_int.data(),
                 n_active, n_ref_q_am, n_embd_head_k,
-                v_tensor ? n_embd_head_v : 0,
+                v_tensor ? (int)n_embd_head_v : 0,
                 n_keep);
 
+            // Debug flags for ablation testing:
+            //   LLAMA_COMPACT_NO_BETA=1  — skip beta bias injection
+            //   LLAMA_COMPACT_NO_CV=1    — skip C_v value refitting
+            static const bool skip_beta = (getenv("LLAMA_COMPACT_NO_BETA") != nullptr);
+            static const bool skip_cv   = (getenv("LLAMA_COMPACT_NO_CV") != nullptr);
+
             // set beta values for kept positions
-            for (uint32_t i = 0; i < n_keep; ++i) {
-                kv->set_compaction_bias(il, h, kept_cells[i], result.beta[i]);
+            if (!skip_beta) {
+                for (uint32_t i = 0; i < n_keep; ++i) {
+                    kv->set_compaction_bias(il, h, kept_cells[i], result.beta[i]);
+                }
             }
 
-            // write K data for kept positions (just the selected rows)
-            std::vector<float> K_kept(n_keep * n_embd_head_k);
-            for (uint32_t i = 0; i < n_keep; ++i) {
-                memcpy(K_kept.data() + i * n_embd_head_k,
-                       K_all + kept_active[i] * n_embd_head_k,
-                       n_embd_head_k * sizeof(float));
-            }
-            kv->write_k_compact(il, h, K_kept.data(), kept_cells.data(), n_keep);
+            // K data for kept positions doesn't change (we keep original keys)
+            // No need to write K back since they're already at the right positions
 
             // write C_v for kept positions
-            if (v_tensor && !result.C_v.empty()) {
+            if (!skip_cv && v_tensor && !result.C_v.empty()) {
                 kv->write_v_compact(il, h, result.C_v.data(), kept_cells.data(), n_keep);
             }
         }
