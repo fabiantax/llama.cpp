@@ -213,6 +213,10 @@ public:
     // clear all compaction biases (e.g. after cache clear or full recomputation)
     void clear_compaction_bias();
 
+    // get per-layer compaction bias data for a given model layer
+    // returns pointer to [n_head_kv * kv_size] floats, or nullptr if no bias for this layer
+    const float * get_compaction_bias_layer(int32_t il) const;
+
     // get the number of KV heads for bias indexing
     uint32_t get_n_head_kv() const;
 
@@ -234,10 +238,16 @@ public:
     void write_v_compact(int32_t il, uint32_t head_kv,
                          const float * v_data, const uint32_t * kept_indices, uint32_t n_kept);
 
-    // after compaction: evict cells not in kept set and defragment
+    // after compaction: evict cells not in kept set
     // kept_indices: sorted array of cell indices to keep (size n_kept)
     // stream: the stream index to compact
     void compact_cells(const uint32_t * kept_indices, uint32_t n_kept, uint32_t stream);
+
+    // defragment: move kept cells to contiguous positions [0, n_kept)
+    // must be called AFTER compact_cells or when cells are scattered
+    // moves K/V tensor data and updates cell metadata + compaction bias
+    // returns mapping: defrag_map[old_cell_idx] = new_cell_idx (only for kept cells)
+    void defrag_after_compact(uint32_t stream);
 
     // get raw K/V tensors for a model layer (for reading data during compaction)
     ggml_tensor * get_k_raw(int32_t il) const;
@@ -451,6 +461,12 @@ public:
 
     // get n_head (query heads) for compaction bias mask expansion
     uint32_t get_n_head() const;
+
+    // get per-layer compaction bias data for a given model layer
+    const float * get_compaction_bias_layer(int32_t il) const;
+
+    // get the total kv cache allocation size (for bias indexing stride)
+    uint32_t get_kv_size() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

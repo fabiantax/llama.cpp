@@ -428,7 +428,11 @@ int32_t llama_kv_compact_impl(
     // update cell metadata: evict non-kept cells
     kv->compact_cells(kept_cells.data(), n_keep, stream);
 
-    LLAMA_LOG_INFO("%s: compaction complete: %u -> %u tokens\n", __func__, n_active, n_keep);
+    // defragment: move kept cells to contiguous positions [0, n_keep)
+    // this reduces n_kv from kv_size to n_keep, dramatically cutting attention compute
+    kv->defrag_after_compact(stream);
+
+    LLAMA_LOG_INFO("%s: compaction complete: %u -> %u tokens (defragmented)\n", __func__, n_active, n_keep);
 
     return (int32_t)n_keep;
 }

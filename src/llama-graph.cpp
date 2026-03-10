@@ -28,11 +28,9 @@ static ggml_tensor * build_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // when compaction bias is active, expand mask dim 2 to n_head (query heads)
-    // so each head can have its own bias value from the compacted KV head it attends to
-    const int64_t n_head_mask = mctx->has_compaction_bias() ? mctx->get_n_head() : 1;
-
-    return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens/n_stream, n_head_mask, n_stream);
+    // mask is always [n_kv, n_tps, 1, n_stream] — per-layer compaction bias
+    // is now injected as separate tensors in the compute graph, not baked into the mask
+    return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens/n_stream, 1, n_stream);
 }
 
 static bool can_reuse_kq_mask(
@@ -44,13 +42,11 @@ static bool can_reuse_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    const int64_t n_head_mask = mctx->has_compaction_bias() ? mctx->get_n_head() : 1;
-
     bool res = true;
 
     res &= (kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
-    res &= (kq_mask->ne[2] == n_head_mask);
+    res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
@@ -435,6 +431,34 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    // fill per-layer compaction bias tensors
+    for (auto & [il, bias_tensor] : self_compaction_bias) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(bias_tensor->buffer));
+        float * data = (float *) bias_tensor->data;
+        const int64_t n_kv      = bias_tensor->ne[0];
+        const int64_t n_head_kv = bias_tensor->ne[2];
+        const int64_t n_stream  = bias_tensor->ne[3];
+
+        const float * layer_bias = mctx->get_compaction_bias_layer(il);
+        if (layer_bias) {
+            // layer_bias is indexed as [head * full_kv_size + cell_idx]
+            // where full_kv_size is the total KV cache allocation
+            // n_kv is the padded active cell count (may be much smaller after defrag)
+            const uint32_t full_kv_size = mctx->get_kv_size();
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t h = 0; h < n_head_kv; ++h) {
+                    float * dst = data + s * n_head_kv * n_kv + h * n_kv;
+                    const float * src = layer_bias + h * full_kv_size;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        dst[j] = (j < (int64_t)full_kv_size) ? src[j] : 0.0f;
+                    }
+                }
+            }
+        } else {
+            std::fill(data, data + ggml_nelements(bias_tensor), 0.0f);
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -448,6 +472,22 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // check compaction bias tensor compatibility
+    const bool has_bias_now = mctx->has_compaction_bias();
+    const bool had_bias     = !self_compaction_bias.empty();
+    if (has_bias_now != had_bias) {
+        res = false; // bias state changed, rebuild graph
+    } else if (has_bias_now) {
+        // check that n_kv matches for existing bias tensors
+        const auto n_kv = mctx->get_n_kv();
+        for (auto & [il, bias_tensor] : self_compaction_bias) {
+            if (bias_tensor->ne[0] != (int64_t)n_kv) {
+                res = false;
+                break;
+            }
+        }
+    }
 
     return res;
 }
@@ -1744,7 +1784,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * compaction_kq_bias) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1758,7 +1799,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // disable flash attention when per-layer compaction bias is active
+    // (flash attention doesn't support per-layer additive bias injection)
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && compaction_kq_bias == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -1833,6 +1876,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kq_b) {
             kq = ggml_add(ctx0, kq, kq_b);
             cb(kq, "kq_plus_kq_b", il);
+        }
+
+        // add per-layer compaction bias (pre-softmax additive correction)
+        if (compaction_kq_bias) {
+            kq = ggml_add(ctx0, kq, compaction_kq_bias);
+            cb(kq, "kq_plus_compact_bias", il);
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
@@ -1963,6 +2012,24 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         ggml_set_input(inp->self_kq_mask);
 
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
+        // create per-layer compaction bias tensors when bias is active
+        if (mctx_cur->has_compaction_bias()) {
+            const auto n_kv = mctx_cur->get_n_kv();
+            const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                if (!hparams.has_kv(il)) continue;
+                if (!mctx_cur->get_compaction_bias_layer(il)) continue;
+
+                const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+                // shape: [n_kv, 1, n_head_kv, n_stream] — broadcasts across tokens
+                ggml_tensor * bias = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                    n_kv, 1, n_head_kv_l, n_stream);
+                ggml_set_input(bias);
+                ggml_set_name(bias, (std::string("compaction_bias_") + std::to_string(il)).c_str());
+                inp->self_compaction_bias[il] = bias;
+            }
+        }
     }
 
     return inp;
@@ -2014,7 +2081,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    // look up per-layer compaction bias
+    ggml_tensor * compact_bias = inp->get_compaction_bias(il);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, compact_bias);
     cb(cur, "kqv_out", il);
 
     if (wo) {

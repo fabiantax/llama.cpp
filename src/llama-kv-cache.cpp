@@ -1457,7 +1457,6 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     float * data = (float *) dst->data;
 
     const int64_t n_kv        = dst->ne[0];
-    const int64_t n_head_mask = dst->ne[2]; // 1 when no bias, n_head when bias active
     const int64_t n_stream    = dst->ne[3]; // num streams in the current ubatch
 
     GGML_ASSERT(n_tokens%n_stream == 0);
@@ -1465,19 +1464,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    const bool has_bias = compaction_bias_active && n_head_mask > 1;
-
-    // when bias is active, the mask tensor is [n_kv, n_tps, n_head, n_stream]
-    // we fill a temporary base mask [n_kv * n_tps * n_stream] (broadcast dim 2 = 1),
-    // then expand it across heads and add per-head bias values
-    std::vector<float> base_mask;
-    float * fill_data = data;
-
-    if (has_bias) {
-        base_mask.resize(n_kv * n_tps * n_stream);
-        fill_data = base_mask.data();
-    }
-
+    // per-layer compaction bias is now injected as separate tensors in the compute graph,
+    // so the mask is always [n_kv, n_tps, 1, n_stream] without per-head expansion
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -1489,65 +1477,13 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.compaction_bias  =*/ compaction_bias,
-        /*.has_bias         =*/ has_bias,
+        /*.has_bias         =*/ false, // bias is injected per-layer in the graph, not in the mask
     };
 
     if (causal_attn) {
-        set_input_kq_mask_impl<true> (args, fill_data);
+        set_input_kq_mask_impl<true> (args, data);
     } else {
-        set_input_kq_mask_impl<false>(args, fill_data);
-    }
-
-    // expand base mask across heads and add per-head compaction bias
-    if (has_bias) {
-        const uint32_t n_head    = (uint32_t) n_head_mask;
-        const uint32_t n_head_kv = hparams.n_head_kv();
-        const uint32_t gqa_ratio = n_head / n_head_kv;
-        const uint32_t kv_size   = get_kv_size();
-
-        for (int64_t s = 0; s < n_stream; ++s) {
-            // base mask for this stream: base_mask[s * n_tps * n_kv ... ]
-            const float * base_s = base_mask.data() + s * n_tps * n_kv;
-
-            for (uint32_t h = 0; h < n_head; ++h) {
-                const uint32_t kv_head = h / gqa_ratio;
-
-                // destination: data[s * n_head * n_tps * n_kv + h * n_tps * n_kv + ...]
-                float * dst_h = data + s * n_head * n_tps * n_kv + h * n_tps * n_kv;
-
-                // copy base mask for this head
-                std::copy(base_s, base_s + n_tps * n_kv, dst_h);
-
-                // add per-key compaction bias for this KV head
-                // the attention mask is shared across all model layers, but beta
-                // values are per-layer. we average betas across layers to produce
-                // a single correction per (kv_head, position) pair.
-                // TODO: for higher accuracy, inject per-layer bias in the graph
-                if (!compaction_bias.empty()) {
-                    for (int64_t t = 0; t < n_tps; ++t) {
-                        for (int64_t j = 0; j < n_kv; ++j) {
-                            if (dst_h[t * n_kv + j] > -INFINITY) {
-                                // average bias across all layers for this (kv_head, position)
-                                float avg_bias = 0.0f;
-                                int n_layers_with_bias = 0;
-                                for (const auto & layer_bias : compaction_bias) {
-                                    if (!layer_bias.empty()) {
-                                        const size_t idx = kv_head * kv_size + j;
-                                        if (idx < layer_bias.size()) {
-                                            avg_bias += layer_bias[idx];
-                                            n_layers_with_bias++;
-                                        }
-                                    }
-                                }
-                                if (n_layers_with_bias > 0) {
-                                    dst_h[t * n_kv + j] += avg_bias / n_layers_with_bias;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        set_input_kq_mask_impl<false>(args, data);
     }
 }
 
@@ -1613,6 +1549,24 @@ void llama_kv_cache::clear_compaction_bias() {
         std::fill(bias.begin(), bias.end(), 0.0f);
     }
     compaction_bias_active = false;
+}
+
+const float * llama_kv_cache::get_compaction_bias_layer(int32_t il) const {
+    if (!compaction_bias_active || compaction_bias.empty()) {
+        return nullptr;
+    }
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    const int32_t kv_layer_id = it->second;
+    if (kv_layer_id < 0 || (size_t)kv_layer_id >= compaction_bias.size()) {
+        return nullptr;
+    }
+    if (compaction_bias[kv_layer_id].empty()) {
+        return nullptr;
+    }
+    return compaction_bias[kv_layer_id].data();
 }
 
 uint32_t llama_kv_cache::get_n_head_kv() const {
@@ -1791,6 +1745,140 @@ void llama_kv_cache::compact_cells(const uint32_t * kept_indices, uint32_t n_kep
 
     // update the head to search from the beginning
     v_heads[stream] = 0;
+}
+
+void llama_kv_cache::defrag_after_compact(uint32_t stream) {
+    GGML_ASSERT(stream < v_cells.size());
+
+    auto & cells = v_cells[stream];
+    const uint32_t kv_size = cells.size();
+
+    // collect non-empty cells in order
+    std::vector<uint32_t> active;
+    active.reserve(kv_size);
+    for (uint32_t i = 0; i < kv_size; ++i) {
+        if (!cells.is_empty(i)) {
+            active.push_back(i);
+        }
+    }
+
+    if (active.empty()) {
+        return;
+    }
+
+    // check if already contiguous starting from 0
+    bool needs_defrag = false;
+    for (uint32_t i = 0; i < active.size(); ++i) {
+        if (active[i] != i) {
+            needs_defrag = true;
+            break;
+        }
+    }
+
+    if (!needs_defrag) {
+        LLAMA_LOG_INFO("%s: cells already contiguous, no defrag needed\n", __func__);
+        return;
+    }
+
+    const uint32_t n_active = active.size();
+
+    LLAMA_LOG_INFO("%s: defragmenting %u cells from scattered positions to [0, %u)\n",
+                   __func__, n_active, n_active);
+
+    // for each layer, move K and V tensor data from old to new positions
+    for (auto & layer : layers) {
+        ggml_tensor * k_tensor = layer.k;
+        ggml_tensor * v_tensor = layer.v;
+
+        if (!k_tensor) continue;
+
+        // move K data: each cell is a row in [n_embd_k_gqa, kv_size]
+        {
+            const size_t row_size = k_tensor->nb[1];
+            std::vector<uint8_t> row_buf(row_size);
+
+            for (uint32_t i = 0; i < n_active; ++i) {
+                if (active[i] == i) continue; // already in place
+
+                // read row from old position
+                ggml_backend_tensor_get(k_tensor, row_buf.data(),
+                                        active[i] * row_size, row_size);
+                // write row to new position
+                ggml_backend_tensor_set(k_tensor, row_buf.data(),
+                                        i * row_size, row_size);
+            }
+        }
+
+        // move V data
+        if (v_tensor) {
+            if (v_trans) {
+                // V is transposed: [kv_size, n_embd_v_gqa]
+                // each cell is a column across all embedding dims
+                const uint32_t n_embd_v_gqa = v_tensor->ne[0];
+                const size_t elem_size = ggml_type_size(v_tensor->type);
+
+                for (uint32_t i = 0; i < n_active; ++i) {
+                    if (active[i] == i) continue;
+
+                    for (uint32_t d = 0; d < n_embd_v_gqa; ++d) {
+                        uint8_t val[sizeof(float)]; // max element size
+                        const size_t src_off = d * v_tensor->nb[1] + active[i] * elem_size;
+                        const size_t dst_off = d * v_tensor->nb[1] + i * elem_size;
+                        ggml_backend_tensor_get(v_tensor, val, src_off, elem_size);
+                        ggml_backend_tensor_set(v_tensor, val, dst_off, elem_size);
+                    }
+                }
+            } else {
+                // V is not transposed: [n_embd_v_gqa, kv_size]
+                const size_t row_size = v_tensor->nb[1];
+                std::vector<uint8_t> row_buf(row_size);
+
+                for (uint32_t i = 0; i < n_active; ++i) {
+                    if (active[i] == i) continue;
+
+                    ggml_backend_tensor_get(v_tensor, row_buf.data(),
+                                            active[i] * row_size, row_size);
+                    ggml_backend_tensor_set(v_tensor, row_buf.data(),
+                                            i * row_size, row_size);
+                }
+            }
+        }
+    }
+
+    // update compaction bias: remap cell indices
+    if (compaction_bias_active && !compaction_bias.empty()) {
+        for (size_t li = 0; li < compaction_bias.size(); ++li) {
+            auto & bias = compaction_bias[li];
+            if (bias.empty()) continue;
+
+            const uint32_t n_head_kv_l = hparams.n_head_kv(layers[li].il);
+            std::vector<float> new_bias(n_head_kv_l * kv_size, 0.0f);
+
+            for (uint32_t h = 0; h < n_head_kv_l; ++h) {
+                for (uint32_t i = 0; i < n_active; ++i) {
+                    new_bias[h * kv_size + i] = bias[h * kv_size + active[i]];
+                }
+            }
+
+            bias = std::move(new_bias);
+        }
+    }
+
+    // update cell metadata using llama_kv_cells public API
+    // 1. save active cell metadata
+    llama_kv_cells saved = cells.cp(active);
+
+    // 2. reset all cells
+    cells.reset();
+
+    // 3. restore at contiguous positions [0, n_active)
+    cells.set(0, saved);
+
+    // set head to n_active so new tokens are allocated right after
+    v_heads[stream] = n_active;
+
+    LLAMA_LOG_INFO("%s: defrag complete, %u cells moved to [0, %u)\n",
+                   __func__, n_active, n_active);
 }
 
 // ============================================================================
@@ -2741,6 +2829,14 @@ bool llama_kv_cache_context::has_compaction_bias() const {
 
 uint32_t llama_kv_cache_context::get_n_head() const {
     return kv->get_n_head();
+}
+
+const float * llama_kv_cache_context::get_compaction_bias_layer(int32_t il) const {
+    return kv->get_compaction_bias_layer(il);
+}
+
+uint32_t llama_kv_cache_context::get_kv_size() const {
+    return kv->get_kv_size();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
