@@ -216,6 +216,9 @@ public:
     // get the number of KV heads for bias indexing
     uint32_t get_n_head_kv() const;
 
+    // get n_head (query heads) — used for per-head mask expansion
+    uint32_t get_n_head() const;
+
     // get the kv_size for bias indexing
     uint32_t get_kv_size() const;
 
@@ -388,6 +391,9 @@ public:
 
     // returns true if the underlying cache has compaction bias values
     bool has_compaction_bias() const;
+
+    // get n_head (query heads) for compaction bias mask expansion
+    uint32_t get_n_head() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

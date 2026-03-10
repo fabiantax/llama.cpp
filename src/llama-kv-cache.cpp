@@ -1618,6 +1618,10 @@ uint32_t llama_kv_cache::get_n_head_kv() const {
     return hparams.n_head_kv();
 }
 
+uint32_t llama_kv_cache::get_n_head() const {
+    return hparams.n_head();
+}
+
 uint32_t llama_kv_cache::get_kv_size() const {
     return v_cells.empty() ? 0 : v_cells[0].size();
 }
@@ -2509,6 +2513,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 
 bool llama_kv_cache_context::has_compaction_bias() const {
     return kv->has_compaction_bias();
+}
+
+uint32_t llama_kv_cache_context::get_n_head() const {
+    return kv->get_n_head();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
