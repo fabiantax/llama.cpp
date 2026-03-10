@@ -27,3 +27,18 @@ Organize todo items for optimized coordination and parallelization. It's better 
 - **Memory Bandwidth**: ~215 GB/s measured, 256 GB/s theoretical (256-bit bus)
 - **Backends**: ROCm/HIP (gfx1151), Vulkan (RADV), CPU
 - **Target Model**: Unsloth Qwen3.5-35B-A3B GGUF (MoE, 2 KV heads)
+
+## Goal
+
+Developer building with AI agents. Target: **500 t/s token generation** (10x over current ~50 t/s baseline).
+
+Key lever: **Attention Matching** — KV cache compression up to 50x with minimal accuracy loss.
+With a 10-50x smaller KV cache, the memory bandwidth bottleneck (~215 GB/s) is spent reading weights
+rather than a bloated cache, unlocking dramatically higher throughput for multi-agent workloads.
+
+Path to 500 t/s:
+- Qwen3.5-35B-A3B only activates ~3B params per token (~6 GB weights at Q4)
+- At 215 GB/s bandwidth, theoretical peak for 6 GB active weights ≈ 35 t/s per stream
+- With 50x KV compaction, KV reads become negligible → nearly all bandwidth goes to weights
+- Parallel batching across agents: 8-16 concurrent streams sharing prefill amortizes overhead
+- Combined batched throughput target: **500+ t/s aggregate across concurrent agent sessions**
