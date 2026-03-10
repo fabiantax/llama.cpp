@@ -1522,7 +1522,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     sched_reserve();
 
-    bool did_optimize = false;
+    bool did_optimize      = false;
+    bool did_auto_compact  = false;
 
     // handle any pending shifts/copies
     memory_update(false);
@@ -1554,6 +1555,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
+                        }
+                    }
+
+                    // try auto-compaction if enabled (KV cache specific)
+                    if (!did_auto_compact) {
+                        did_auto_compact = true;
+
+                        auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+                        if (kv && kv->get_auto_compact_enabled()) {
+                            if (kv->try_auto_compact(this)) {
+                                LLAMA_LOG_DEBUG("%s: retrying batch size %d after auto-compaction\n", __func__, balloc->get_n_tokens());
+                                continue;
+                            }
                         }
                     }
 
@@ -3295,6 +3309,19 @@ void llama_kv_cache_capture_q(
         return;
     }
     kv->set_q_capture(enable);
+}
+
+void llama_kv_cache_set_auto_compact(
+        struct llama_context * ctx,
+                       float   threshold,
+  struct llama_compact_params   params) {
+    auto * memory = ctx->get_memory();
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: memory type is not llama_kv_cache\n", __func__);
+        return;
+    }
+    kv->set_auto_compact(threshold, params);
 }
 
 // llama state API

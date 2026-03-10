@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kv-compact.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1882,6 +1883,65 @@ void llama_kv_cache::clear_captured_q() {
     }
 }
 
+//
+// auto-compaction
+//
+
+void llama_kv_cache::set_auto_compact(float threshold, llama_compact_params params) {
+    if (threshold <= 0.0f) {
+        auto_compact_enabled = false;
+        LLAMA_LOG_INFO("%s: auto-compaction disabled\n", __func__);
+        return;
+    }
+
+    if (threshold > 1.0f) {
+        threshold = 1.0f;
+    }
+
+    auto_compact_enabled   = true;
+    auto_compact_threshold = threshold;
+    auto_compact_params    = params;
+
+    LLAMA_LOG_INFO("%s: auto-compaction enabled (threshold=%.1f%%, target_ratio=%.2f)\n",
+                   __func__, threshold * 100.0f, params.target_ratio);
+}
+
+bool llama_kv_cache::get_auto_compact_enabled() const {
+    return auto_compact_enabled;
+}
+
+bool llama_kv_cache::try_auto_compact(llama_context * ctx) {
+    if (!auto_compact_enabled || !ctx) {
+        return false;
+    }
+
+    // check if cache usage exceeds threshold
+    // use stream 0 (unified cache)
+    const uint32_t kv_size = get_size();
+    const uint32_t used    = get_used_cells(0);
+    const float    usage   = (float)used / (float)kv_size;
+
+    if (usage < auto_compact_threshold) {
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: cache usage %.1f%% exceeds threshold %.1f%%, triggering auto-compaction\n",
+                   __func__, usage * 100.0f, auto_compact_threshold * 100.0f);
+
+    // run compaction on sequence 0 (default for single-sequence generation)
+    const int32_t result = llama_kv_compact_impl(ctx, 0, auto_compact_params);
+
+    if (result < 0) {
+        LLAMA_LOG_ERROR("%s: auto-compaction failed\n", __func__);
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: auto-compaction complete: %u -> %d tokens (%.1f%% cache usage)\n",
+                   __func__, used, result, (float)result / (float)kv_size * 100.0f);
+
+    return true;
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -2242,6 +2302,37 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             }
         }
     }
+
+    // Write compaction bias data
+    {
+        const uint32_t has_bias = compaction_bias_active ? 1 : 0;
+        io.write(&has_bias, sizeof(has_bias));
+
+        if (compaction_bias_active) {
+            const uint32_t kv_size = v_cells[cr.strm].size();
+
+            for (uint32_t li = 0; li < n_layer; ++li) {
+                const uint32_t il = layers[li].il;
+                const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+
+                io.write(&n_head_kv_l, sizeof(n_head_kv_l));
+
+                // write bias values for active cells in each head
+                for (uint32_t h = 0; h < n_head_kv_l; ++h) {
+                    for (const auto & range : cr.data) {
+                        for (uint32_t i = range.first; i < range.second; ++i) {
+                            float bias_val = 0.0f;
+                            if (li < compaction_bias.size() &&
+                                (h * kv_size + i) < compaction_bias[li].size()) {
+                                bias_val = compaction_bias[li][h * kv_size + i];
+                            }
+                            io.write(&bias_val, sizeof(bias_val));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
@@ -2510,6 +2601,49 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         for (uint32_t i = 0; i < cell_count; ++i) {
                             const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
                             ggml_backend_tensor_set(v, (const char*)src + i * v_size_el, dst_offset, v_size_el);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Read compaction bias data
+    {
+        uint32_t has_bias;
+        io.read_to(&has_bias, sizeof(has_bias));
+
+        if (has_bias) {
+            clear_compaction_bias();
+
+            const uint32_t kv_size = cells.size();
+
+            for (uint32_t li = 0; li < (uint32_t)layers.size(); ++li) {
+                const uint32_t il = layers[li].il;
+
+                uint32_t n_head_kv_l;
+                io.read_to(&n_head_kv_l, sizeof(n_head_kv_l));
+
+                if (n_head_kv_l != hparams.n_head_kv(il)) {
+                    LLAMA_LOG_ERROR("%s: mismatched n_head_kv (%u != %u, layer %u)\n",
+                                    __func__, n_head_kv_l, hparams.n_head_kv(il), il);
+                    return false;
+                }
+
+                for (uint32_t h = 0; h < n_head_kv_l; ++h) {
+                    if (sinfo.is_contiguous()) {
+                        const float * bias_data = (const float *)io.read(cell_count * sizeof(float));
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            if (bias_data[i] != 0.0f) {
+                                set_compaction_bias(il, h, sinfo.head() + i, bias_data[i]);
+                            }
+                        }
+                    } else {
+                        const float * bias_data = (const float *)io.read(cell_count * sizeof(float));
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            if (bias_data[i] != 0.0f) {
+                                set_compaction_bias(il, h, sinfo.idxs[0][i], bias_data[i]);
+                            }
                         }
                     }
                 }

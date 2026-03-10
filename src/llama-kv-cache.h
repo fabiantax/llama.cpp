@@ -278,6 +278,21 @@ public:
     // clear all captured Q vectors
     void clear_captured_q();
 
+    //
+    // auto-compaction API
+    //
+
+    // configure automatic compaction when cache fills beyond threshold
+    void set_auto_compact(float threshold, llama_compact_params params);
+
+    // check if auto-compaction is enabled
+    bool get_auto_compact_enabled() const;
+
+    // attempt auto-compaction if conditions are met (called from decode path)
+    // ctx: context needed for compaction algorithm
+    // returns true if compaction was performed and slots may now be available
+    bool try_auto_compact(llama_context * ctx);
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -336,6 +351,13 @@ private:
     // values are added to attention scores (pre-softmax) for compacted keys
     std::vector<std::vector<float>> compaction_bias;
     bool compaction_bias_active = false; // fast check to skip bias logic when no biases set
+
+    // auto-compaction configuration
+    // when enabled, compaction is triggered automatically when the cache fills
+    // beyond the threshold during init_batch (before returning FAILED_PREPARE)
+    bool     auto_compact_enabled   = false;
+    float    auto_compact_threshold = 0.9f;  // fraction of kv_size at which to trigger
+    llama_compact_params auto_compact_params = {};
 
     // Q capture storage (CPU-side)
     // when q_capture_active is true, Q vectors are captured during decode via eval callback

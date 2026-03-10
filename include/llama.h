@@ -785,6 +785,20 @@ extern "C" {
             struct llama_context * ctx,
                               bool enable);
 
+    // Enable automatic KV cache compaction during generation
+    // When enabled, the cache is automatically compacted when it fills beyond
+    // the specified threshold, allowing continuous generation without manual
+    // compaction calls. The paper demonstrates up to 6 consecutive compressions
+    // without quality loss.
+    //
+    // threshold: fraction of cache capacity at which to trigger (e.g. 0.9 = 90%)
+    //            set to 0.0 to disable auto-compaction
+    // params:    compaction parameters (target_ratio, etc.)
+    LLAMA_API void llama_kv_cache_set_auto_compact(
+            struct llama_context * ctx,
+                           float   threshold,
+      struct llama_compact_params   params);
+
     //
     // State / sessions
     //
