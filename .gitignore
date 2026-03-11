@@ -164,3 +164,6 @@ perf_log_broadcast.txt
 perf_log_broadcast_extracted.json
 *.obj
 graphrag-pipeline/sources/*_extracted.json
+
+# Downloaded datasets
+wikitext-2-raw/
