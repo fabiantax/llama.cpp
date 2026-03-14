@@ -64,6 +64,7 @@ static inline __m512 __avx512_repeat_f32cx16_load(__m128i x) {
     return _mm512_loadu_ps(tmp);
 }
 #endif
+#ifndef GGML_F32Cx8_LOAD  // Avoid duplicate when simd-mappings.h already defines this
 static inline __m256 __avx_f32cx8_load(const ggml_fp16_t *x) {
     float tmp[8];
 
@@ -73,6 +74,7 @@ static inline __m256 __avx_f32cx8_load(const ggml_fp16_t *x) {
 
     return _mm256_loadu_ps(tmp);
 }
+#endif // GGML_F32Cx8_LOAD
 static inline __m256 __avx_repeat_f32cx8_load(const ggml_fp16_t *x) {
     float tmp[8];
 

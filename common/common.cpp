@@ -1090,10 +1090,12 @@ common_init_result::common_init_result(common_params & params) :
                     __func__, uma_threads, n_phys);
             }
 
-            // Enable UMA bandwidth profiler if no eval callback is set and verbosity >= 1.
-            // The profiler measures per-op timing during the first few iterations to
-            // classify ops as bandwidth-bound vs compute-bound (APEX-inspired analysis).
-            if (!params.cb_eval && params.verbosity >= 1) {
+            // UMA bandwidth profiler DISABLED — causes 5x server regression.
+            // The cb_eval callback fires on every op of every token, adding massive
+            // overhead. Even after the 5-iteration profiling window, the callback
+            // remains registered and continues firing (checking profiling_active flag).
+            // TODO: Only enable when explicitly requested via --uma-profile flag.
+            if (false && !params.cb_eval && params.verbosity >= 1) {
                 LOG_INF("%s:   UMA profiler enabled — will analyze bandwidth utilization for first 5 iterations\n", __func__);
                 pimpl->uma_profiler = std::make_unique<uma_profiler_data>();
                 params.cb_eval = uma_profiler_cb_eval;
