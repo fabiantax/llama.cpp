@@ -643,6 +643,55 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
+        // Cache-aware expert routing for MoE models (arxiv 2412.00099)
+        // When serving multiple concurrent slots, bias the router toward a fixed
+        // expert subset so all tokens route to the same experts, reducing unique
+        // expert weight reads by ~60%. Enabled via --expert-cache-bonus flag.
+        if (params_base.expert_cache_bonus > 0.0f) {
+            const int n_layer = llama_model_n_layer(model);
+            // Get expert count from model metadata
+            int n_expert = 0, n_expert_used = 0;
+            {
+                char buf[64];
+                const char * expert_keys[] = {
+                    "qwen3next.expert_count", "qwen35moe.expert_count",
+                    "deepseek2.expert_count", "mixtral.expert_count", nullptr
+                };
+                const char * used_keys[] = {
+                    "qwen3next.expert_used_count", "qwen35moe.expert_used_count",
+                    "deepseek2.expert_used_count", "mixtral.expert_used_count", nullptr
+                };
+                for (const char ** k = expert_keys; *k; k++) {
+                    if (llama_model_meta_val_str(model, *k, buf, sizeof(buf)) > 0) {
+                        n_expert = atoi(buf); break;
+                    }
+                }
+                for (const char ** k = used_keys; *k; k++) {
+                    if (llama_model_meta_val_str(model, *k, buf, sizeof(buf)) > 0) {
+                        n_expert_used = atoi(buf); break;
+                    }
+                }
+            }
+
+            if (n_expert > 0) {
+                // Bias toward the first 2*K experts per layer (simulates warm cache)
+                int n_cached = std::min(n_expert_used * 2, n_expert);
+                std::vector<std::vector<float>> bias_data(n_layer, std::vector<float>(n_expert, 0.0f));
+                std::vector<const float *> bias_ptrs(n_layer);
+
+                for (int il = 0; il < n_layer; il++) {
+                    for (int e = 0; e < n_cached; e++) {
+                        bias_data[il][e] = params_base.expert_cache_bonus;
+                    }
+                    bias_ptrs[il] = bias_data[il].data();
+                }
+
+                llama_set_expert_cache_bias(model, bias_ptrs.data(), n_layer);
+                SRV_INF("expert cache-aware routing enabled: bonus=%.2f, cached=%d/%d experts per layer\n",
+                         params_base.expert_cache_bonus, n_cached, n_expert);
+            }
+        }
+
         if (params_base.speculative.has_dft()) {
             SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
 
