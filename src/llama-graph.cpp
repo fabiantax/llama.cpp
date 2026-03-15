@@ -5,6 +5,16 @@
 #include "llama-cparams.h"
 #include "llama-model.h"
 
+// Expert cache bias: copy model's bias data into the backend-managed tensor
+void llm_graph_input_expert_cache_bias::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (bias && model && !model->expert_cache_bias.empty() &&
+            il < (int)model->expert_cache_bias.size() && model->expert_cache_bias[il]) {
+        ggml_backend_tensor_set(bias, model->expert_cache_bias[il]->data, 0,
+                                n_expert * sizeof(float));
+    }
+}
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -1263,14 +1273,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // expert_cache_bias is a [n_expert, 1] tensor filled with cache_bonus
     // for cached experts and 0.0 for uncached experts. It's set externally
     // via llama_set_expert_cache_bias() before each decode step.
-    // Cache-aware routing: scale selection_probs to prefer cached experts.
-    // For prototype: uniform bonus applied via ggml_scale (not per-expert).
-    // Full per-expert bias requires graph input integration (TODO).
+    // Cache-aware expert routing (arxiv 2412.00099): bias selection toward
+    // experts already in GPU cache. Uses llm_graph_input to properly allocate
+    // the bias tensor in backend-managed buffers.
     if (model != nullptr && !model->expert_cache_bias.empty() &&
             il < (int)model->expert_cache_bias.size() && model->expert_cache_bias[il] != nullptr) {
-        // Use the model's bias tensor directly (it's in a tracked ggml_context)
-        selection_probs = ggml_add(ctx0, selection_probs, model->expert_cache_bias[il]);
+        auto inp = std::make_unique<llm_graph_input_expert_cache_bias>(model, il, n_expert);
+        inp->bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
+        ggml_set_input(inp->bias);
+        ggml_set_name(inp->bias, "expert_cache_bias");
+        selection_probs = ggml_add(ctx0, selection_probs, inp->bias);
         cb(selection_probs, "ffn_moe_cache_biased", il);
+        res->add_input(std::move(inp));
     }
 
     // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k

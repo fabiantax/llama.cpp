@@ -501,6 +501,23 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// Cache-aware expert routing bias input (arxiv 2412.00099)
+class llm_graph_input_expert_cache_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_expert_cache_bias(const struct llama_model * model, int il, int64_t n_expert)
+        : model(model), il(il), n_expert(n_expert) {}
+    virtual ~llm_graph_input_expert_cache_bias() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * bias = nullptr; // F32 [n_expert]
+
+private:
+    const struct llama_model * model;
+    int il;
+    int64_t n_expert;
+};
+
 //
 // llm_graph_result
 //
