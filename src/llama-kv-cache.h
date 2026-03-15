@@ -199,6 +199,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    void set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) override;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;

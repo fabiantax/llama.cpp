@@ -765,6 +765,18 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // Attention bias
+    //
+
+    // Set a per-cell additive attention bias for KV cache compaction.
+    // The bias is added to QK^T logits before softmax (via the attention mask).
+    // This implements the beta term from attention-matching compaction:
+    //   softmax(q @ k_j / sqrt(d) + bias_j) instead of softmax(q @ k_j / sqrt(d))
+    // bias_data: array of n floats, one per cell starting at cell 0
+    // Call after llama_state_seq_set_data() to set biases for the compacted cache.
+    LLAMA_API void llama_memory_set_attn_bias(llama_memory_t mem, llama_seq_id seq_id, const float * bias_data, int32_t n);
+
+    //
     // State / sessions
     //
 
@@ -969,6 +981,16 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Set cache-aware expert routing bias for MoE models (arxiv 2412.00099).
+    // bias_per_layer: array of n_layer float arrays, each of size n_expert.
+    //   bias_per_layer[il][e] > 0 means expert e in layer il is cached (prefer it).
+    //   Pass nullptr to disable cache-aware routing.
+    // Typical cache_bonus: 0.5 (sweep 0.1-2.0 for quality/hit-rate tradeoff).
+    LLAMA_API void llama_set_expert_cache_bias(
+            struct llama_model * model,
+            const float ** bias_per_layer,
+            int32_t n_layers);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

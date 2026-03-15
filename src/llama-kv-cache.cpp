@@ -1482,6 +1482,23 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) {
+    if (n <= 0 || !bias_data) {
+        return;
+    }
+
+    // find which stream this sequence maps to
+    const uint32_t stream = seq_to_stream.at(seq_id);
+    auto & cells = v_cells.at(stream);
+
+    // set bias for cells 0..n-1 in this stream
+    // typically called after state restore, so cells 0..n-1 are the compacted cells
+    const int32_t n_set = std::min(n, (int32_t)cells.size());
+    for (int32_t i = 0; i < n_set; i++) {
+        cells.set_bias(i, bias_data[i]);
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 

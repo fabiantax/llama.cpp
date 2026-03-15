@@ -8630,6 +8630,46 @@ void llama_model_free(llama_model * model) {
     delete model;
 }
 
+void llama_set_expert_cache_bias(
+        llama_model * model,
+        const float ** bias_per_layer,
+        int32_t n_layers) {
+    if (!model) return;
+
+    const int n_layer = (int)model->hparams.n_layer;
+    const int n_expert = (int)model->hparams.n_expert;
+
+    if (n_expert == 0) return;
+
+    // Free previous bias context
+    if (model->expert_cache_bias_ctx) {
+        ggml_free(model->expert_cache_bias_ctx);
+        model->expert_cache_bias_ctx = nullptr;
+    }
+    model->expert_cache_bias.clear();
+
+    if (!bias_per_layer) {
+        model->expert_cache_bias.resize(n_layer, nullptr);
+        return;
+    }
+
+    // Allocate a single ggml context for all bias tensors
+    // Each tensor: overhead (~256 bytes) + data (n_expert * 4 bytes)
+    size_t ctx_size = (size_t)n_layer * (GGML_TENSOR_SIZE + GGML_MEM_ALIGN + n_expert * sizeof(float)) + 4096;
+    struct ggml_init_params params = { ctx_size, nullptr, false };
+    model->expert_cache_bias_ctx = ggml_init(params);
+
+    model->expert_cache_bias.resize(n_layer, nullptr);
+    for (int il = 0; il < n_layer && il < n_layers; il++) {
+        if (bias_per_layer[il] != nullptr && model->layers[il].ffn_gate_inp != nullptr) {
+            struct ggml_tensor * bias = ggml_new_tensor_1d(model->expert_cache_bias_ctx, GGML_TYPE_F32, n_expert);
+            memcpy(bias->data, bias_per_layer[il], n_expert * sizeof(float));
+            ggml_set_name(bias, "expert_cache_bias");
+            model->expert_cache_bias[il] = bias;
+        }
+    }
+}
+
 int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
 }

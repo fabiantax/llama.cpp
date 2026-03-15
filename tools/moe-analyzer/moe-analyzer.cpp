@@ -58,22 +58,20 @@ struct moe_collector_data {
     int n_expert_used = 0;
     bool save_logits  = false;
 
-    // collection state
-    int current_token = 0;
+    // collection state — batch_offset is set before each llama_decode()
+    int batch_offset  = 0;
+    int total_tokens  = 0;
     std::vector<uint8_t> tmp_buf;  // for GPU->host copies
 
     // per-token, per-layer expert selections: [token][layer][expert_used]
+    // buffered in memory, written in token-major order in finish()
     std::vector<std::vector<std::vector<int32_t>>> selections;
 
     // per-token, per-layer gating logits (optional): [token][layer][n_expert]
     std::vector<std::vector<std::vector<float>>> logits;
 
-    // layer tracking: which layers have we seen this token?
-    std::vector<bool> layer_seen;
-
     // output file
     std::string out_file;
-    FILE * fp = nullptr;
 
     void init(int nl, int ne, int neu, bool sl, const std::string & of) {
         n_layers      = nl;
@@ -81,62 +79,75 @@ struct moe_collector_data {
         n_expert_used = neu;
         save_logits   = sl;
         out_file      = of;
-        layer_seen.resize(nl, false);
+    }
 
-        fp = fopen(out_file.c_str(), "wb");
+    void ensure_token(int global_tok) {
+        while ((int)selections.size() <= global_tok) {
+            selections.push_back(std::vector<std::vector<int32_t>>(n_layers));
+            if (save_logits) {
+                logits.push_back(std::vector<std::vector<float>>(n_layers));
+            }
+        }
+        if (global_tok >= total_tokens) {
+            total_tokens = global_tok + 1;
+        }
+    }
+
+    void record_topk(int layer, int batch_tok, const int32_t * ids, int n_ids) {
+        if (layer < 0 || layer >= n_layers) return;
+        int global_tok = batch_offset + batch_tok;
+        ensure_token(global_tok);
+        selections[global_tok][layer] = std::vector<int32_t>(ids, ids + n_ids);
+    }
+
+    void record_logits(int layer, int batch_tok, const float * data, int n) {
+        if (!save_logits) return;
+        if (layer < 0 || layer >= n_layers) return;
+        int global_tok = batch_offset + batch_tok;
+        ensure_token(global_tok);
+        logits[global_tok][layer] = std::vector<float>(data, data + n);
+    }
+
+    void finish() {
+        FILE * fp = fopen(out_file.c_str(), "wb");
         if (!fp) {
             LOG_ERR("Failed to open output file: %s\n", out_file.c_str());
             return;
         }
 
-        // write placeholder header (will be updated in finish() with auto-detected values)
+        // write header
         moe_log_header hdr = {};
         memcpy(hdr.magic, MOE_LOG_MAGIC, 8);
-        hdr.n_layers      = nl;
-        hdr.n_experts     = ne;
-        hdr.n_expert_used = neu;
-        hdr.flags         = sl ? 1 : 0;
+        hdr.n_layers      = n_layers;
+        hdr.n_experts     = n_experts;
+        hdr.n_expert_used = n_expert_used;
+        hdr.flags         = save_logits ? 1u : 0u;
         fwrite(&hdr, sizeof(hdr), 1, fp);
-    }
 
-    void new_token() {
-        current_token++;
-        std::fill(layer_seen.begin(), layer_seen.end(), false);
-    }
+        // write in token-major order: for each token, for each layer
+        int written = 0;
+        for (int t = 0; t < total_tokens; t++) {
+            bool complete = true;
+            for (int l = 0; l < n_layers; l++) {
+                if ((int)selections[t][l].size() != n_expert_used) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete) continue;
 
-    void record_topk(int layer, const int32_t * ids, int n_ids) {
-        if (layer < 0 || layer >= n_layers) return;
-        layer_seen[layer] = true;
-
-        // write to file immediately (streaming)
-        if (fp) {
-            fwrite(ids, sizeof(int32_t), n_ids, fp);
+            for (int l = 0; l < n_layers; l++) {
+                fwrite(selections[t][l].data(), sizeof(int32_t), n_expert_used, fp);
+                if (save_logits && !logits[t][l].empty()) {
+                    fwrite(logits[t][l].data(), sizeof(float), n_experts, fp);
+                }
+            }
+            written++;
         }
-    }
 
-    void record_logits(int layer, const float * data, int n) {
-        if (!save_logits || !fp) return;
-        if (layer < 0 || layer >= n_layers) return;
-        fwrite(data, sizeof(float), n, fp);
-    }
-
-    void finish() {
-        if (fp) {
-            // rewrite header with auto-detected values
-            fseek(fp, 0, SEEK_SET);
-            moe_log_header hdr = {};
-            memcpy(hdr.magic, MOE_LOG_MAGIC, 8);
-            hdr.n_layers      = n_layers;
-            hdr.n_experts     = n_experts;
-            hdr.n_expert_used = n_expert_used;
-            hdr.flags         = save_logits ? 1u : 0u;
-            fwrite(&hdr, sizeof(hdr), 1, fp);
-
-            fclose(fp);
-            fp = nullptr;
-        }
-        LOG_INF("MoE expert selections saved to %s (%d tokens, %d experts, top-%d)\n",
-            out_file.c_str(), current_token, n_experts, n_expert_used);
+        fclose(fp);
+        LOG_INF("MoE expert selections saved to %s (%d tokens written, %d experts, top-%d)\n",
+            out_file.c_str(), written, n_experts, n_expert_used);
     }
 };
 
@@ -189,7 +200,7 @@ static bool moe_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         // for each token in the batch
         for (int64_t tok = 0; tok < n_tokens; tok++) {
             const int32_t * ids = data + tok * neu;
-            g_collector.record_topk(layer, ids, (int)neu);
+            g_collector.record_topk(layer, (int)tok, ids, (int)neu);
         }
         return true;
     }
@@ -221,7 +232,7 @@ static bool moe_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         }
 
         for (int64_t tok = 0; tok < n_tokens; tok++) {
-            g_collector.record_logits(layer, data + tok * n_expert, (int)n_expert);
+            g_collector.record_logits(layer, (int)tok, data + tok * n_expert, (int)n_expert);
         }
         return true;
     }
@@ -937,9 +948,10 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Input: %zu tokens\n", tokens.size());
 
-    // process tokens in chunks
+    // process tokens in chunks — use ubatch size so each llama_decode() maps 1:1
+    // with internal ubatch processing, keeping batch_offset correct
     const int n_ctx   = llama_n_ctx(ctx);
-    const int n_batch = llama_n_batch(ctx);
+    const int n_batch = llama_n_ubatch(ctx);
 
     LOG_INF("Context: %d, batch: %d\n", n_ctx, n_batch);
 
@@ -955,13 +967,14 @@ int main(int argc, char ** argv) {
             common_batch_add(batch, tokens[n_processed + i], n_processed + i, {0}, last_token);
         }
 
+        // set batch offset so callback can compute global token indices
+        g_collector.batch_offset = n_processed;
+
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("Failed to decode batch at position %d\n", n_processed);
             llama_batch_free(batch);
             break;
         }
-
-        g_collector.current_token = n_processed + n_eval;
 
         n_processed += n_eval;
         llama_batch_free(batch);
@@ -1003,12 +1016,14 @@ int main(int argc, char ** argv) {
             common_batch_clear(batch);
             common_batch_add(batch, new_token, n_processed + n_gen, {0}, true);
 
+            // set batch offset for single-token decode
+            g_collector.batch_offset = n_processed + n_gen;
+
             if (llama_decode(ctx, batch) != 0) {
                 LOG_ERR("Failed to decode during generation at token %d\n", n_gen);
                 break;
             }
 
-            g_collector.current_token = n_processed + n_gen + 1;
             n_gen++;
 
             if (n_gen % 10 == 0) {

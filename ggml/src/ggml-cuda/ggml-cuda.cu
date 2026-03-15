@@ -117,10 +117,18 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// UMA detection cache — file-scope so disable_uma can modify it
+static bool uma_cached[GGML_CUDA_MAX_DEVICES] = {};
+static bool uma_results[GGML_CUDA_MAX_DEVICES] = {};
+
+static void ggml_cuda_disable_device_uma(int device) {
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+        uma_results[device] = false;
+        uma_cached[device] = true;
+    }
+}
+
 static bool ggml_cuda_is_device_uma(int device) {
-    // Cache results per device to avoid repeated cudaGetDeviceProperties calls
-    static bool cached[GGML_CUDA_MAX_DEVICES] = {};
-    static bool results[GGML_CUDA_MAX_DEVICES] = {};
     static bool uma_env_checked = false;
     static bool uma_env = false;
 
@@ -132,8 +140,8 @@ static bool ggml_cuda_is_device_uma(int device) {
         return true;
     }
 
-    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && cached[device]) {
-        return results[device];
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES && uma_cached[device]) {
+        return uma_results[device];
     }
 
 #if defined(GGML_USE_HIP)
@@ -144,14 +152,38 @@ static bool ggml_cuda_is_device_uma(int device) {
         cudaDeviceProp prop;
         cudaError_t err = cudaGetDeviceProperties(&prop, device);
         bool is_uma = (err == cudaSuccess && prop.integrated);
-        results[device] = is_uma;
-        cached[device] = true;
+
+        // Verify UMA actually works: test hipMallocManaged + CoarseGrain
+        // Some integrated GPUs (e.g. gfx1151) report integrated=true but
+        // don't support hipMemAdvise(SetCoarseGrain), breaking UMA path.
+        if (is_uma) {
+            ggml_cuda_set_device(device);
+            void * test_ptr = nullptr;
+            cudaError_t alloc_err = cudaMallocManaged(&test_ptr, 1024);
+            if (alloc_err == hipSuccess) {
+                cudaError_t advise_err = cudaMemAdvise(test_ptr, 1024, hipMemAdviseSetCoarseGrain, device);
+                cudaFree(test_ptr);
+                if (advise_err != hipSuccess) {
+                    GGML_LOG_WARN("gfx1151 UMA probe: hipMemAdvise(SetCoarseGrain) failed, disabling UMA mode.\n");
+                    is_uma = false;
+                }
+            } else {
+                is_uma = false;
+            }
+        }
+
+        uma_results[device] = is_uma;
+        uma_cached[device] = true;
         return is_uma;
     }
 #endif
 
     return false;
 }
+
+// Forward declarations for UMA prefetch helpers (defined later in file)
+static bool ggml_cuda_uma_prefetch_enabled();
+static int  ggml_cuda_uma_prefetch_lookahead();
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
@@ -160,7 +192,15 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
-            CUDA_CHECK(cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device));
+            cudaError_t advise_err = cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
+            if (advise_err != hipSuccess) {
+                // CoarseGrain not supported (e.g. gfx1151) — disable UMA for this device
+                // so all downstream code uses the discrete GPU path (explicit memcpy, no prefetch)
+                GGML_LOG_WARN("hipMemAdvise(SetCoarseGrain) failed on device %d, disabling UMA mode.\n", device);
+                ggml_cuda_disable_device_uma(device);
+                cudaFree(*ptr);
+                err = cudaMalloc(ptr, size);
+            }
         }
 
         // fall back to cudaMalloc if not supported (e.g. on Windows)
@@ -296,6 +336,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpbo = prop.sharedMemPerBlock;
 
         info.devices[id].cc = ggml_cuda_parse_id(prop.gcnArchName);
+
+        // RDNA 3.5 iGPU (gfx1150/gfx1151) reports 64KB LDS but a single
+        // workgroup can only use 32KB. Cap smpbo to prevent kernel crashes.
+        if (GGML_CUDA_CC_IS_RDNA3_5(info.devices[id].cc)) {
+            info.devices[id].smpbo = 32768;
+            GGML_LOG_INFO("gfx1151: capping shared memory to 32KB (dual-CU limit)\n");
+        }
         if ((info.devices[id].cc & 0xff00) == 0x0) {
             GGML_LOG_WARN("invalid architecture ID received for device %d %s: %s  cc %d.%d\n",
                             id, prop.name, prop.gcnArchName, prop.major, prop.minor);
@@ -2309,14 +2356,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
     if (!split && use_mul_mat_vec_f) {
-        // the custom F16 vector kernel can be used over batched cuBLAS GEMM
-        // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        GGML_LOG_DEBUG("MUL_MAT: vec_f path, src0=%s ne=[%ld,%ld], src1 ne1=%ld\n", ggml_type_name(src0->type), (long)src0->ne[0], (long)src0->ne[1], (long)src1->ne[1]);
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
+        GGML_LOG_DEBUG("MUL_MAT: mat_f path, src0=%s\n", ggml_type_name(src0->type));
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
+        GGML_LOG_DEBUG("MUL_MAT: vec_q path, src0=%s ne=[%ld,%ld], src1 ne1=%ld\n", ggml_type_name(src0->type), (long)src0->ne[0], (long)src0->ne[1], (long)src1->ne[1]);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
+        GGML_LOG_DEBUG("MUL_MAT: mat_q path, src0=%s ne=[%ld,%ld], src1 ne1=%ld\n", ggml_type_name(src0->type), (long)src0->ne[0], (long)src0->ne[1], (long)src1->ne[1]);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {

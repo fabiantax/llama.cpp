@@ -533,6 +533,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const struct llama_model     * model = nullptr; // for expert_cache_bias
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -743,6 +744,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const struct llama_model * model; // for expert_cache_bias
 
     const llm_graph_cb & cb_func;
 

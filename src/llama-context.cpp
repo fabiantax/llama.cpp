@@ -2158,6 +2158,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.model       =*/ &model,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3285,6 +3286,14 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+void llama_memory_set_attn_bias(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+         const float * bias_data,
+             int32_t   n) {
+    mem->set_attn_bias(seq_id, bias_data, n);
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

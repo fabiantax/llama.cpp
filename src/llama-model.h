@@ -495,6 +495,12 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // Cache-aware expert routing bias (arxiv 2412.00099).
+    // Per-layer [n_expert, 1] tensors with cache_bonus for cached experts.
+    // Set externally via llama_set_expert_cache_bias(). nullptr = disabled.
+    std::vector<struct ggml_tensor *> expert_cache_bias;
+    struct ggml_context * expert_cache_bias_ctx = nullptr; // owns the bias tensors
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
