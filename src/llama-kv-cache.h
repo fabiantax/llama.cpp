@@ -303,6 +303,8 @@ public:
     // returns true if compaction was performed and slots may now be available
     bool try_auto_compact(llama_context * ctx);
 
+    void set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) override;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;

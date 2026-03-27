@@ -5,6 +5,7 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "ggml-opt.h"
+#include "gguf.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -440,19 +441,30 @@ extern "C" {
 
     LLAMA_API void llama_detach_threadpool(struct llama_context * ctx);
 
+    typedef void (*llama_model_set_tensor_data_t)(struct ggml_tensor * tensor, void * userdata);
+
+    // Create a new model from GGUF metadata as well as a function to set the tensor data
+    //   - tensors are created as GGML_TYPE_F32 by default,
+    //     override by adding a tensor with the same name but a different name to the context
+    LLAMA_API struct llama_model * llama_model_init_from_user(
+                    struct gguf_context * metadata,
+          llama_model_set_tensor_data_t   set_tensor_data,    // function to initialize tensor data with
+                                   void * set_tensor_data_ud, // userdata for function
+              struct llama_model_params   params);
+
     DEPRECATED(LLAMA_API struct llama_model * llama_load_model_from_file(
                              const char * path_model,
               struct llama_model_params   params),
             "use llama_model_load_from_file instead");
 
-    // Load the model from a file
+    // Load a model from a file
     // If the file is split into multiple parts, the file name must follow this pattern: <name>-%05d-of-%05d.gguf
     // If the split file name does not follow this pattern, use llama_model_load_from_splits
     LLAMA_API struct llama_model * llama_model_load_from_file(
                              const char * path_model,
               struct llama_model_params   params);
 
-    // Load the model from multiple splits (support custom naming scheme)
+    // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(
                              const char ** paths,
@@ -799,6 +811,17 @@ extern "C" {
                            float   threshold,
       struct llama_compact_params   params);
 
+    // Attention bias
+    //
+
+    // Set a per-cell additive attention bias for KV cache compaction.
+    // The bias is added to QK^T logits before softmax (via the attention mask).
+    // This implements the beta term from attention-matching compaction:
+    //   softmax(q @ k_j / sqrt(d) + bias_j) instead of softmax(q @ k_j / sqrt(d))
+    // bias_data: array of n floats, one per cell starting at cell 0
+    // Call after llama_state_seq_set_data() to set biases for the compacted cache.
+    LLAMA_API void llama_memory_set_attn_bias(llama_memory_t mem, llama_seq_id seq_id, const float * bias_data, int32_t n);
+
     //
     // State / sessions
     //
@@ -1005,6 +1028,16 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // Set cache-aware expert routing bias for MoE models (arxiv 2412.00099).
+    // bias_per_layer: array of n_layer float arrays, each of size n_expert.
+    //   bias_per_layer[il][e] > 0 means expert e in layer il is cached (prefer it).
+    //   Pass nullptr to disable cache-aware routing.
+    // Typical cache_bonus: 0.5 (sweep 0.1-2.0 for quality/hit-rate tradeoff).
+    LLAMA_API void llama_set_expert_cache_bias(
+            struct llama_model * model,
+            const float ** bias_per_layer,
+            int32_t n_layers);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
@@ -1020,7 +1053,7 @@ extern "C" {
 
     // Logits for the ith token. For positive indices, Equivalent to:
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
-    // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
+    // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
@@ -1035,7 +1068,7 @@ extern "C" {
 
     // Get the embeddings for the ith token. For positive indices, Equivalent to:
     // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd
-    // Negative indicies can be used to access embeddings in reverse order, -1 is the last embedding.
+    // Negative indices can be used to access embeddings in reverse order, -1 is the last embedding.
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -1055,9 +1088,9 @@ extern "C" {
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
 
-    // Get the backend sampled probabilites for the ith token
+    // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().
-    // Returns NULL if no probabilites were generated.
+    // Returns NULL if no probabilities were generated.
     LLAMA_API float *  llama_get_sampled_probs_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t llama_get_sampled_probs_count_ith(struct llama_context * ctx, int32_t i);
 
@@ -1384,7 +1417,7 @@ extern "C" {
                                float   tau,
                                float   eta);
 
-    /// @details Intializes a GBNF grammar, see grammars/README.md for details.
+    /// @details Initializes a GBNF grammar, see grammars/README.md for details.
     /// @param vocab The vocabulary that this grammar will be used with.
     /// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.
     /// @param grammar_root The name of the start symbol for the grammar.

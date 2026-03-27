@@ -586,7 +586,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             break;
         }
 
-        // remeber the position that we found
+        // remember the position that we found
         res.push_back(sinfo_new);
 
         // store the old state of the cells in the recovery stack
@@ -1300,7 +1300,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // bookeeping of the KQ mask cells that could change for other tokens of the same sequence
+        // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
@@ -1484,6 +1484,23 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<true> (args, data);
     } else {
         set_input_kq_mask_impl<false>(args, data);
+    }
+}
+
+void llama_kv_cache::set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) {
+    if (n <= 0 || !bias_data) {
+        return;
+    }
+
+    // find which stream this sequence maps to
+    const uint32_t stream = seq_to_stream.at(seq_id);
+    auto & cells = v_cells.at(stream);
+
+    // set bias for cells 0..n-1 in this stream
+    // typically called after state restore, so cells 0..n-1 are the compacted cells
+    const int32_t n_set = std::min(n, (int32_t)cells.size());
+    for (int32_t i = 0; i < n_set; i++) {
+        cells.set_bias(i, bias_data[i]);
     }
 }
 
@@ -2283,8 +2300,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            // TODO: we also need to save llama_kv_cell_ext when apply_ubatch() support loading it
-            //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+            if (hparams.n_pos_per_embd() > 1) {
+                const llama_kv_cell_ext ext = cells.ext_get(i);
+                io.write(&ext, sizeof(ext));
+            }
 
             for (const auto & seq_id : seq_ids) {
                 io.write(&seq_id, sizeof(seq_id));
@@ -2447,6 +2466,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                 return false;
+            }
+
+            if (hparams.n_pos_per_embd() > 1) {
+                llama_kv_cell_ext ext;
+                io.read_to(&ext, sizeof(ext));
+
+                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead

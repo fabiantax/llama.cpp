@@ -167,3 +167,7 @@ graphrag-pipeline/sources/*_extracted.json
 
 # Downloaded datasets
 wikitext-2-raw/
+
+# Profiling / temp
+perf_log_*.txt
+*.comp.bak

@@ -34,6 +34,7 @@ public:
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
+            bias[i]  = 0.0f;
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
@@ -63,6 +64,7 @@ public:
     void resize(uint32_t n) {
         pos.resize(n);
         ext.resize(n);
+        bias.resize(n, 0.0f);
         shift.resize(n);
         seq.resize(n);
 
@@ -129,6 +131,7 @@ public:
 
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
+            res.bias[j] = bias[idx];
             res.seq[j] = seq[idx];
 
             assert(shift[idx] == 0);
@@ -148,6 +151,7 @@ public:
 
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
+            res.bias[j] = bias[idx];
             res.seq[j] = seq[idx];
 
             assert(shift[idx] == 0);
@@ -177,6 +181,7 @@ public:
 
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
+            bias[idx] = other.bias[j];
             seq[idx] = other.seq[j];
 
             if (pos[idx] != -1) {
@@ -367,6 +372,14 @@ public:
         return pos[i];
     }
 
+    float get_bias(uint32_t i) const {
+        return bias[i];
+    }
+
+    void set_bias(uint32_t i, float b) {
+        bias[i] = b;
+    }
+
     const llama_kv_cell_ext & ext_get(uint32_t i) const {
         assert(i < pos.size());
         assert(pos[i] != -1);
@@ -462,6 +475,9 @@ private:
     std::set<uint32_t> used;
 
     std::vector<llama_pos> pos;
+
+    // per-cell additive attention bias (added to QK^T logits via the mask)
+    std::vector<float> bias;
 
     // stores extra info per cell
     std::vector<llama_kv_cell_ext> ext;
