@@ -12,6 +12,60 @@
 #include <map>
 #include <vector>
 
+// EMA-based expert cache for MoE models — predicts which experts will be needed next token.
+// Standalone, zero external deps. See kv-compact-moe-cache.h for docs and test harness.
+struct moe_expert_cache {
+    bool  enabled        = false;
+    int   n_layers       = 0;
+    int   n_experts      = 0;
+    int   cache_size     = 32;     // number of "hot" experts per layer
+    float alpha          = 0.1f;   // EMA decay rate
+    float bias_strength  = 0.3f;   // routing bias magnitude for cached experts
+
+    std::vector<std::vector<float>> ema;  // per-layer EMA scores
+
+    void init(int nl, int ne) {
+        n_layers  = nl;
+        n_experts = ne;
+        ema.resize(nl);
+        for (int l = 0; l < nl; l++) ema[l].assign(ne, 0.0f);
+        enabled = true;
+    }
+
+    void reset() {
+        for (int l = 0; l < n_layers; l++)
+            std::fill(ema[l].begin(), ema[l].end(), 0.0f);
+    }
+
+    void update(int layer, const int32_t * expert_ids, int n_used) {
+        if (!enabled || layer < 0 || layer >= n_layers) return;
+        auto & e = ema[layer];
+        const float decay = 1.0f - alpha;
+        for (int i = 0; i < n_experts; i++) e[i] *= decay;
+        for (int i = 0; i < n_used; i++) {
+            const int eid = expert_ids[i];
+            if (eid >= 0 && eid < n_experts) e[eid] += alpha;
+        }
+    }
+
+    void compute_bias(int layer, float * out_bias) const {
+        if (!enabled || layer < 0 || layer >= n_layers) return;
+        const auto & e = ema[layer];
+        std::vector<float> sorted_ema(e.begin(), e.end());
+        std::sort(sorted_ema.begin(), sorted_ema.end(), std::greater<float>());
+        const int eff = std::min(cache_size, n_experts);
+        const float threshold = (eff > 0 && eff <= n_experts) ? sorted_ema[eff - 1] : 0.0f;
+        for (int i = 0; i < n_experts; i++)
+            out_bias[i] = (e[i] >= threshold && threshold > 0.0f) ? bias_strength : 0.0f;
+    }
+
+    std::vector<float> compute_bias_vec(int layer) const {
+        std::vector<float> bias(n_experts, 0.0f);
+        if (enabled && n_experts > 0) compute_bias(layer, bias.data());
+        return bias;
+    }
+};
+
 struct llama_model;
 class llama_batch_allocr;
 
@@ -339,6 +393,10 @@ private:
     ggml_backend_buffer_ptr buf_output;
 
     bool has_evaluated_once = false;
+
+    // Dynamic EMA-based expert cache for MoE models
+    // Predicts which experts will be needed next token, biases routing accordingly.
+    struct moe_expert_cache expert_cache;
 
     // APEX runtime scheduling (UMA bandwidth-aware offload)
     // Inline policy state — full apex_scheduler.h included only in common/.

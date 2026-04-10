@@ -94,8 +94,7 @@ struct llama_memory_i {
     virtual bool get_can_shift() const = 0;
 
     // attention bias support (default no-op for non-KV caches)
-    virtual void set_attn_bias(llama_seq_id /*seq_id*/, const float * /*bias_data*/, int32_t /*n*/) {
-    }
+    virtual void set_attn_bias(llama_seq_id /*seq_id*/, const float * /*bias_data*/, int32_t /*n*/) {}
 
     //
     // ops

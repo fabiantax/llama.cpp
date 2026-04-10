@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 
 // APEX runtime scheduling - inlined to avoid dependency on common/ library.
@@ -77,6 +78,13 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    // Initialize EMA expert cache for MoE models
+    if (hparams.n_expert > 0) {
+        expert_cache.init(hparams.n_layer, hparams.n_expert);
+        LLAMA_LOG_INFO("%s: expert cache initialized: %d layers, %d experts, cache_size=%d\n",
+                __func__, hparams.n_layer, hparams.n_expert, expert_cache.cache_size);
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -1223,6 +1231,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        // Set dynamic EMA expert cache bias before compute (MoE only)
+        if (expert_cache.enabled && has_evaluated_once) {
+            const auto & hp = model.hparams;
+            std::vector<const float *> bias_ptrs(hp.n_layer, nullptr);
+            std::vector<std::vector<float>> bias_storage(hp.n_layer);
+            for (int il = 0; il < hp.n_layer; il++) {
+                auto bias = expert_cache.compute_bias_vec(il);
+                if (std::any_of(bias.begin(), bias.end(), [](float v) { return v > 0.0f; })) {
+                    bias_storage[il] = std::move(bias);
+                    bias_ptrs[il] = bias_storage[il].data();
+                }
+            }
+            llama_set_expert_cache_bias(const_cast<llama_model *>(&model), bias_ptrs.data(), hp.n_layer);
+        }
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
@@ -1234,6 +1257,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // Update EMA expert cache from selected expert IDs (MoE decode steps only)
+    if (expert_cache.enabled && gtype == LLM_GRAPH_TYPE_DECODE) {
+        const auto & hp = model.hparams;
+        auto * gf = res->get_gf();
+        for (int il = 0; il < hp.n_layer; il++) {
+            struct ggml_tensor * t = ggml_graph_get_tensor(gf, ("ffn_moe_topk-" + std::to_string(il)).c_str());
+            if (t && t->data) {
+                const int32_t * ids = (const int32_t *)t->data;
+                // t->ne[0] = n_tokens, t->ne[1] = n_expert_used
+                const int n_expert_used = t->ne[1];
+                expert_cache.update(il, ids, n_expert_used);
+            }
+        }
+        has_evaluated_once = true;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3330,6 +3369,9 @@ void llama_memory_set_attn_bias(
           llama_seq_id seq_id,
          const float * bias_data,
              int32_t   n) {
+    if (!mem) {
+        return;
+    }
     mem->set_attn_bias(seq_id, bias_data, n);
 }
 

@@ -764,6 +764,12 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Set per-cell additive attention bias for KV cache compaction.
+    // The bias is added to QK^T logits before softmax (via the attention mask).
+    // bias_data: array of n floats, one per cell starting at cell 0.
+    // Call after llama_state_seq_set_data() to set biases for the compacted cache.
+    LLAMA_API void llama_memory_set_attn_bias(llama_memory_t mem, llama_seq_id seq_id, const float * bias_data, int32_t n);
+
     //
     // KV cache compaction (Attention Matching)
     //

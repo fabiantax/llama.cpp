@@ -213,6 +213,7 @@ public:
 
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
+            bias[idx] = other.bias[j];
             seq[idx] = other.seq[j];
 
             if (pos[idx] != -1) {

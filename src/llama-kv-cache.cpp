@@ -1409,7 +1409,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 if (alibi) {
                     data[idst + j] = -std::abs(p0 - p1);
                 } else {
-                    data[idst + j] = 0.0f;
+                    data[idst + j] = cells.get_bias(j); // attention bias from KV compaction
                 }
 
                 continue;
