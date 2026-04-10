@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kv-compact.h"
 
 #include <algorithm>
 #include <cassert>
@@ -224,6 +225,8 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    clear_compaction_bias();
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -583,7 +586,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             break;
         }
 
-        // remeber the position that we found
+        // remember the position that we found
         res.push_back(sinfo_new);
 
         // store the old state of the cells in the recovery stack
@@ -1265,6 +1268,10 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // compaction bias (optional, may be empty)
+    const std::vector<std::vector<float>> & compaction_bias;
+    bool                                    has_bias;
 };
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
@@ -1293,7 +1300,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // bookeeping of the KQ mask cells that could change for other tokens of the same sequence
+        // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
@@ -1402,7 +1409,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 if (alibi) {
                     data[idst + j] = -std::abs(p0 - p1);
                 } else {
-                    data[idst + j] = 0.0f;
+                    data[idst + j] = cells.get_bias(j); // attention bias from KV compaction
                 }
 
                 continue;
@@ -1449,16 +1456,16 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
-    const int64_t n_kv     = dst->ne[0];
-    const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+    const int64_t n_kv        = dst->ne[0];
+    const int64_t n_stream    = dst->ne[3]; // num streams in the current ubatch
 
     GGML_ASSERT(n_tokens%n_stream == 0);
 
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    //const int64_t t_start = ggml_time_us();
-
+    // per-layer compaction bias is now injected as separate tensors in the compute graph,
+    // so the mask is always [n_kv, n_tps, 1, n_stream] without per-head expansion
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -1469,6 +1476,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.compaction_bias  =*/ compaction_bias,
+        /*.has_bias         =*/ false, // bias is injected per-layer in the graph, not in the mask
     };
 
     if (causal_attn) {
@@ -1476,10 +1485,23 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     } else {
         set_input_kq_mask_impl<false>(args, data);
     }
+}
 
-    //const int64_t t_end = ggml_time_us();
+void llama_kv_cache::set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) {
+    if (n <= 0 || !bias_data) {
+        return;
+    }
 
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+    // find which stream this sequence maps to
+    const uint32_t stream = seq_to_stream.at(seq_id);
+    auto & cells = v_cells.at(stream);
+
+    // set bias for cells 0..n-1 in this stream
+    // typically called after state restore, so cells 0..n-1 are the compacted cells
+    const int32_t n_set = std::min(n, (int32_t)cells.size());
+    for (int32_t i = 0; i < n_set; i++) {
+        cells.set_bias(i, bias_data[i]);
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -1505,6 +1527,524 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
             }
         }
     }
+}
+
+//
+// compaction API
+//
+
+bool llama_kv_cache::has_compaction_bias() const {
+    return compaction_bias_active;
+}
+
+void llama_kv_cache::set_compaction_bias(int32_t il, uint32_t head_kv, uint32_t cell_idx, float beta) {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+
+    const int32_t kv_layer_id = it->second;
+    const uint32_t kv_size = get_kv_size();
+    const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+
+    GGML_ASSERT(head_kv < n_head_kv_l);
+    GGML_ASSERT(cell_idx < kv_size);
+
+    // lazy init: allocate bias vectors on first use
+    if (compaction_bias.empty()) {
+        compaction_bias.resize(layers.size());
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const uint32_t n_hkv = hparams.n_head_kv(layers[i].il);
+            compaction_bias[i].resize(n_hkv * kv_size, 0.0f);
+        }
+    }
+
+    compaction_bias[kv_layer_id][head_kv * kv_size + cell_idx] = beta;
+    compaction_bias_active = true;
+}
+
+void llama_kv_cache::clear_compaction_bias() {
+    for (auto & bias : compaction_bias) {
+        std::fill(bias.begin(), bias.end(), 0.0f);
+    }
+    compaction_bias_active = false;
+}
+
+const float * llama_kv_cache::get_compaction_bias_layer(int32_t il) const {
+    if (!compaction_bias_active || compaction_bias.empty()) {
+        return nullptr;
+    }
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    const int32_t kv_layer_id = it->second;
+    if (kv_layer_id < 0 || (size_t)kv_layer_id >= compaction_bias.size()) {
+        return nullptr;
+    }
+    if (compaction_bias[kv_layer_id].empty()) {
+        return nullptr;
+    }
+    return compaction_bias[kv_layer_id].data();
+}
+
+uint32_t llama_kv_cache::get_n_head_kv() const {
+    return hparams.n_head_kv();
+}
+
+uint32_t llama_kv_cache::get_n_head() const {
+    return hparams.n_head();
+}
+
+uint32_t llama_kv_cache::get_kv_size() const {
+    return v_cells.empty() ? 0 : v_cells[0].size();
+}
+
+void llama_kv_cache::write_k_compact(int32_t il, uint32_t head_kv,
+                                     const float * k_data, const uint32_t * kept_indices, uint32_t n_kept) {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+
+    const auto & layer = layers[it->second];
+    ggml_tensor * k_tensor = layer.k;
+
+    const uint32_t n_embd_k_gqa = k_tensor->ne[0];
+    const uint32_t n_embd_head_k = hparams.n_embd_head_k;
+    const uint32_t head_offset = head_kv * n_embd_head_k;
+
+    GGML_ASSERT(head_offset + n_embd_head_k <= n_embd_k_gqa);
+
+    if (k_tensor->type == GGML_TYPE_F32) {
+        for (uint32_t i = 0; i < n_kept; ++i) {
+            const uint32_t cell = kept_indices[i];
+            const size_t offset = cell * k_tensor->nb[1] + head_offset * sizeof(float);
+            ggml_backend_tensor_set(k_tensor, k_data + i * n_embd_head_k, offset, n_embd_head_k * sizeof(float));
+        }
+    } else if (k_tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(n_embd_head_k);
+        for (uint32_t i = 0; i < n_kept; ++i) {
+            const uint32_t cell = kept_indices[i];
+            for (uint32_t j = 0; j < n_embd_head_k; ++j) {
+                tmp[j] = ggml_fp32_to_fp16(k_data[i * n_embd_head_k + j]);
+            }
+            const size_t offset = cell * k_tensor->nb[1] + head_offset * ggml_type_size(GGML_TYPE_F16);
+            ggml_backend_tensor_set(k_tensor, tmp.data(), offset, n_embd_head_k * ggml_type_size(GGML_TYPE_F16));
+        }
+    } else {
+        GGML_ABORT("write_k_compact: unsupported K type %s (only F32/F16)", ggml_type_name(k_tensor->type));
+    }
+}
+
+void llama_kv_cache::write_v_compact(int32_t il, uint32_t head_kv,
+                                     const float * v_data, const uint32_t * kept_indices, uint32_t n_kept) {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+
+    const auto & layer = layers[it->second];
+    ggml_tensor * v_tensor = layer.v;
+
+    if (!v_tensor) {
+        return; // MLA models have no V tensor
+    }
+
+    const uint32_t n_embd_v_gqa = v_tensor->ne[0];
+    const uint32_t n_embd_head_v = hparams.n_embd_head_v;
+
+    if (v_trans) {
+        // V is transposed: shape [kv_size, n_embd_v_gqa]
+        // v_data[i][j] needs to go to v_tensor[kept_indices[i]][head_kv * n_embd_head_v + j]
+        // i.e., row j (embedding dim), column kept_indices[i] (kv pos)
+        if (v_tensor->type == GGML_TYPE_F32) {
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                    const float val = v_data[i * n_embd_head_v + j];
+                    const uint32_t v_row = head_kv * n_embd_head_v + j;
+                    const size_t offset = v_row * v_tensor->nb[1] + cell * sizeof(float);
+                    ggml_backend_tensor_set(v_tensor, &val, offset, sizeof(float));
+                }
+            }
+        } else if (v_tensor->type == GGML_TYPE_F16) {
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                    const ggml_fp16_t val = ggml_fp32_to_fp16(v_data[i * n_embd_head_v + j]);
+                    const uint32_t v_row = head_kv * n_embd_head_v + j;
+                    const size_t offset = v_row * v_tensor->nb[1] + cell * ggml_type_size(GGML_TYPE_F16);
+                    ggml_backend_tensor_set(v_tensor, &val, offset, ggml_type_size(GGML_TYPE_F16));
+                }
+            }
+        } else {
+            GGML_ABORT("write_v_compact: unsupported V type %s (only F32/F16)", ggml_type_name(v_tensor->type));
+        }
+    } else {
+        // V is not transposed: shape [n_embd_v_gqa, kv_size]
+        const uint32_t head_offset = head_kv * n_embd_head_v;
+        GGML_ASSERT(head_offset + n_embd_head_v <= n_embd_v_gqa);
+
+        if (v_tensor->type == GGML_TYPE_F32) {
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                const size_t offset = cell * v_tensor->nb[1] + head_offset * sizeof(float);
+                ggml_backend_tensor_set(v_tensor, v_data + i * n_embd_head_v, offset, n_embd_head_v * sizeof(float));
+            }
+        } else if (v_tensor->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n_embd_head_v);
+            for (uint32_t i = 0; i < n_kept; ++i) {
+                const uint32_t cell = kept_indices[i];
+                for (uint32_t j = 0; j < n_embd_head_v; ++j) {
+                    tmp[j] = ggml_fp32_to_fp16(v_data[i * n_embd_head_v + j]);
+                }
+                const size_t offset = cell * v_tensor->nb[1] + head_offset * ggml_type_size(GGML_TYPE_F16);
+                ggml_backend_tensor_set(v_tensor, tmp.data(), offset, n_embd_head_v * ggml_type_size(GGML_TYPE_F16));
+            }
+        } else {
+            GGML_ABORT("write_v_compact: unsupported V type %s (only F32/F16)", ggml_type_name(v_tensor->type));
+        }
+    }
+}
+
+ggml_tensor * llama_kv_cache::get_k_raw(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+    return layers[it->second].k;
+}
+
+ggml_tensor * llama_kv_cache::get_v_raw(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+    return layers[it->second].v;
+}
+
+bool llama_kv_cache::get_v_trans() const {
+    return v_trans;
+}
+
+uint32_t llama_kv_cache::get_used_cells(uint32_t stream) const {
+    GGML_ASSERT(stream < v_cells.size());
+    uint32_t count = 0;
+    const auto & cells = v_cells[stream];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+llama_pos llama_kv_cache::get_cell_pos(uint32_t stream, uint32_t cell_idx) const {
+    GGML_ASSERT(stream < v_cells.size());
+    return v_cells[stream].pos_get(cell_idx);
+}
+
+bool llama_kv_cache::is_cell_empty(uint32_t stream, uint32_t cell_idx) const {
+    GGML_ASSERT(stream < v_cells.size());
+    return v_cells[stream].is_empty(cell_idx);
+}
+
+void llama_kv_cache::compact_cells(const uint32_t * kept_indices, uint32_t n_kept, uint32_t stream) {
+    GGML_ASSERT(stream < v_cells.size());
+
+    auto & cells = v_cells[stream];
+    const uint32_t kv_size = cells.size();
+
+    // build a set of kept indices for fast lookup
+    std::vector<bool> is_kept(kv_size, false);
+    for (uint32_t i = 0; i < n_kept; ++i) {
+        GGML_ASSERT(kept_indices[i] < kv_size);
+        is_kept[kept_indices[i]] = true;
+    }
+
+    // mark non-kept cells as empty
+    for (uint32_t i = 0; i < kv_size; ++i) {
+        if (!cells.is_empty(i) && !is_kept[i]) {
+            cells.rm(i);
+        }
+    }
+
+    // update the head to search from the beginning
+    v_heads[stream] = 0;
+}
+
+void llama_kv_cache::defrag_after_compact(uint32_t stream) {
+    GGML_ASSERT(stream < v_cells.size());
+
+    auto & cells = v_cells[stream];
+    const uint32_t kv_size = cells.size();
+
+    // collect non-empty cells in order
+    std::vector<uint32_t> active;
+    active.reserve(kv_size);
+    for (uint32_t i = 0; i < kv_size; ++i) {
+        if (!cells.is_empty(i)) {
+            active.push_back(i);
+        }
+    }
+
+    if (active.empty()) {
+        return;
+    }
+
+    // check if already contiguous starting from 0
+    bool needs_defrag = false;
+    for (uint32_t i = 0; i < active.size(); ++i) {
+        if (active[i] != i) {
+            needs_defrag = true;
+            break;
+        }
+    }
+
+    if (!needs_defrag) {
+        LLAMA_LOG_INFO("%s: cells already contiguous, no defrag needed\n", __func__);
+        return;
+    }
+
+    const uint32_t n_active = active.size();
+
+    LLAMA_LOG_INFO("%s: defragmenting %u cells from scattered positions to [0, %u)\n",
+                   __func__, n_active, n_active);
+
+    // for each layer, move K and V tensor data from old to new positions
+    for (auto & layer : layers) {
+        ggml_tensor * k_tensor = layer.k;
+        ggml_tensor * v_tensor = layer.v;
+
+        if (!k_tensor) continue;
+
+        // move K data: each cell is a row in [n_embd_k_gqa, kv_size]
+        {
+            const size_t row_size = k_tensor->nb[1];
+            std::vector<uint8_t> row_buf(row_size);
+
+            for (uint32_t i = 0; i < n_active; ++i) {
+                if (active[i] == i) continue; // already in place
+
+                // read row from old position
+                ggml_backend_tensor_get(k_tensor, row_buf.data(),
+                                        active[i] * row_size, row_size);
+                // write row to new position
+                ggml_backend_tensor_set(k_tensor, row_buf.data(),
+                                        i * row_size, row_size);
+            }
+        }
+
+        // move V data
+        if (v_tensor) {
+            if (v_trans) {
+                // V is transposed: [kv_size, n_embd_v_gqa]
+                // each cell is a column across all embedding dims
+                const uint32_t n_embd_v_gqa = v_tensor->ne[0];
+                const size_t elem_size = ggml_type_size(v_tensor->type);
+
+                for (uint32_t i = 0; i < n_active; ++i) {
+                    if (active[i] == i) continue;
+
+                    for (uint32_t d = 0; d < n_embd_v_gqa; ++d) {
+                        uint8_t val[sizeof(float)]; // max element size
+                        const size_t src_off = d * v_tensor->nb[1] + active[i] * elem_size;
+                        const size_t dst_off = d * v_tensor->nb[1] + i * elem_size;
+                        ggml_backend_tensor_get(v_tensor, val, src_off, elem_size);
+                        ggml_backend_tensor_set(v_tensor, val, dst_off, elem_size);
+                    }
+                }
+            } else {
+                // V is not transposed: [n_embd_v_gqa, kv_size]
+                const size_t row_size = v_tensor->nb[1];
+                std::vector<uint8_t> row_buf(row_size);
+
+                for (uint32_t i = 0; i < n_active; ++i) {
+                    if (active[i] == i) continue;
+
+                    ggml_backend_tensor_get(v_tensor, row_buf.data(),
+                                            active[i] * row_size, row_size);
+                    ggml_backend_tensor_set(v_tensor, row_buf.data(),
+                                            i * row_size, row_size);
+                }
+            }
+        }
+    }
+
+    // update compaction bias: remap cell indices
+    if (compaction_bias_active && !compaction_bias.empty()) {
+        for (size_t li = 0; li < compaction_bias.size(); ++li) {
+            auto & bias = compaction_bias[li];
+            if (bias.empty()) continue;
+
+            const uint32_t n_head_kv_l = hparams.n_head_kv(layers[li].il);
+            std::vector<float> new_bias(n_head_kv_l * kv_size, 0.0f);
+
+            for (uint32_t h = 0; h < n_head_kv_l; ++h) {
+                for (uint32_t i = 0; i < n_active; ++i) {
+                    new_bias[h * kv_size + i] = bias[h * kv_size + active[i]];
+                }
+            }
+
+            bias = std::move(new_bias);
+        }
+    }
+
+    // update cell metadata using llama_kv_cells public API
+    // 1. save active cell metadata
+    llama_kv_cells saved = cells.cp(active);
+
+    // 2. reset all cells
+    cells.reset();
+
+    // 3. restore at contiguous positions [0, n_active)
+    cells.set(0, saved);
+
+    // set head to n_active so new tokens are allocated right after
+    v_heads[stream] = n_active;
+
+    LLAMA_LOG_INFO("%s: defrag complete, %u cells moved to [0, %u)\n",
+                   __func__, n_active, n_active);
+}
+
+// ============================================================================
+// Q capture implementation
+// ============================================================================
+
+void llama_kv_cache::set_q_capture(bool enable) {
+    q_capture_enabled = enable;
+    if (!enable) {
+        clear_captured_q();
+    }
+}
+
+bool llama_kv_cache::get_q_capture() const {
+    return q_capture_enabled;
+}
+
+void llama_kv_cache::store_captured_q(int32_t il, const float * q_data,
+                                       uint32_t n_tokens, uint32_t n_head, uint32_t n_embd_head) {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return; // layer not in KV cache (e.g. no KV for this layer)
+    }
+    const int32_t kv_layer_id = it->second;
+
+    // lazy init
+    if (captured_q.empty()) {
+        captured_q.resize(layers.size());
+    }
+
+    auto & cq = captured_q[kv_layer_id];
+    const size_t total = (size_t)n_tokens * n_head * n_embd_head;
+    cq.data.resize(total);
+    memcpy(cq.data.data(), q_data, total * sizeof(float));
+    cq.n_tokens    = n_tokens;
+    cq.n_head      = n_head;
+    cq.n_embd_head = n_embd_head;
+}
+
+bool llama_kv_cache::has_captured_q(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return false;
+    if (captured_q.empty()) return false;
+    const int32_t kv_layer_id = it->second;
+    return kv_layer_id < (int32_t)captured_q.size() && captured_q[kv_layer_id].n_tokens > 0;
+}
+
+const float * llama_kv_cache::get_captured_q(int32_t il, uint32_t head_kv, uint32_t * out_n_q) const {
+    auto it = map_layer_ids.find(il);
+    GGML_ASSERT(it != map_layer_ids.end());
+    const int32_t kv_layer_id = it->second;
+    GGML_ASSERT(kv_layer_id < (int32_t)captured_q.size());
+
+    const auto & cq = captured_q[kv_layer_id];
+    GGML_ASSERT(cq.n_tokens > 0);
+
+    // Q tensor is [n_tokens, n_head, n_embd_head] (row-major)
+    // For GQA: multiple query heads map to one KV head
+    // We return all query head vectors that map to this KV head
+    const uint32_t n_head_kv_l = hparams.n_head_kv(layers[kv_layer_id].il);
+    const uint32_t gqa_ratio   = cq.n_head / n_head_kv_l;
+    const uint32_t q_head_start = head_kv * gqa_ratio;
+    const uint32_t n_q_per_head = cq.n_tokens * gqa_ratio;
+
+    // Flatten: for each token, extract the gqa_ratio query heads belonging to this KV head
+    // Result: [n_tokens * gqa_ratio, n_embd_head]
+    // We use a thread-local buffer to avoid allocation per call
+    thread_local std::vector<float> q_buf;
+    q_buf.resize(n_q_per_head * cq.n_embd_head);
+
+    for (uint32_t t = 0; t < cq.n_tokens; ++t) {
+        for (uint32_t g = 0; g < gqa_ratio; ++g) {
+            const uint32_t src_head = q_head_start + g;
+            const float * src = cq.data.data() + (t * cq.n_head + src_head) * cq.n_embd_head;
+            float * dst = q_buf.data() + (t * gqa_ratio + g) * cq.n_embd_head;
+            memcpy(dst, src, cq.n_embd_head * sizeof(float));
+        }
+    }
+
+    *out_n_q = n_q_per_head;
+    return q_buf.data();
+}
+
+void llama_kv_cache::clear_captured_q() {
+    for (auto & cq : captured_q) {
+        cq.data.clear();
+        cq.n_tokens = 0;
+        cq.n_head = 0;
+        cq.n_embd_head = 0;
+    }
+}
+
+//
+// auto-compaction
+//
+
+void llama_kv_cache::set_auto_compact(float threshold, llama_compact_params params) {
+    if (threshold <= 0.0f) {
+        auto_compact_enabled = false;
+        LLAMA_LOG_INFO("%s: auto-compaction disabled\n", __func__);
+        return;
+    }
+
+    if (threshold > 1.0f) {
+        threshold = 1.0f;
+    }
+
+    auto_compact_enabled   = true;
+    auto_compact_threshold = threshold;
+    auto_compact_params    = params;
+
+    LLAMA_LOG_INFO("%s: auto-compaction enabled (threshold=%.1f%%, target_ratio=%.2f)\n",
+                   __func__, threshold * 100.0f, params.target_ratio);
+}
+
+bool llama_kv_cache::get_auto_compact_enabled() const {
+    return auto_compact_enabled;
+}
+
+bool llama_kv_cache::try_auto_compact(llama_context * ctx) {
+    if (!auto_compact_enabled || !ctx) {
+        return false;
+    }
+
+    // check if cache usage exceeds threshold
+    // use stream 0 (unified cache)
+    const uint32_t kv_size = get_size();
+    const uint32_t used    = get_used_cells(0);
+    const float    usage   = (float)used / (float)kv_size;
+
+    if (usage < auto_compact_threshold) {
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: cache usage %.1f%% exceeds threshold %.1f%%, triggering auto-compaction\n",
+                   __func__, usage * 100.0f, auto_compact_threshold * 100.0f);
+
+    // run compaction on sequence 0 (default for single-sequence generation)
+    const int32_t result = llama_kv_compact_impl(ctx, 0, auto_compact_params);
+
+    if (result < 0) {
+        LLAMA_LOG_ERROR("%s: auto-compaction failed\n", __func__);
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: auto-compaction complete: %u -> %d tokens (%.1f%% cache usage)\n",
+                   __func__, used, result, (float)result / (float)kv_size * 100.0f);
+
+    return true;
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -1760,8 +2300,10 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            // TODO: we also need to save llama_kv_cell_ext when apply_ubatch() support loading it
-            //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+            if (hparams.n_pos_per_embd() > 1) {
+                const llama_kv_cell_ext ext = cells.ext_get(i);
+                io.write(&ext, sizeof(ext));
+            }
 
             for (const auto & seq_id : seq_ids) {
                 io.write(&seq_id, sizeof(seq_id));
@@ -1867,6 +2409,37 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             }
         }
     }
+
+    // Write compaction bias data
+    {
+        const uint32_t has_bias = compaction_bias_active ? 1 : 0;
+        io.write(&has_bias, sizeof(has_bias));
+
+        if (compaction_bias_active) {
+            const uint32_t kv_size = v_cells[cr.strm].size();
+
+            for (uint32_t li = 0; li < n_layer; ++li) {
+                const uint32_t il = layers[li].il;
+                const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+
+                io.write(&n_head_kv_l, sizeof(n_head_kv_l));
+
+                // write bias values for active cells in each head
+                for (uint32_t h = 0; h < n_head_kv_l; ++h) {
+                    for (const auto & range : cr.data) {
+                        for (uint32_t i = range.first; i < range.second; ++i) {
+                            float bias_val = 0.0f;
+                            if (li < compaction_bias.size() &&
+                                (h * kv_size + i) < compaction_bias[li].size()) {
+                                bias_val = compaction_bias[li][h * kv_size + i];
+                            }
+                            io.write(&bias_val, sizeof(bias_val));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
@@ -1893,6 +2466,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                 return false;
+            }
+
+            if (hparams.n_pos_per_embd() > 1) {
+                llama_kv_cell_ext ext;
+                io.read_to(&ext, sizeof(ext));
+
+                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -2142,6 +2723,49 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
+    // Read compaction bias data
+    {
+        uint32_t has_bias;
+        io.read_to(&has_bias, sizeof(has_bias));
+
+        if (has_bias) {
+            clear_compaction_bias();
+
+            const uint32_t kv_size = cells.size();
+
+            for (uint32_t li = 0; li < (uint32_t)layers.size(); ++li) {
+                const uint32_t il = layers[li].il;
+
+                uint32_t n_head_kv_l;
+                io.read_to(&n_head_kv_l, sizeof(n_head_kv_l));
+
+                if (n_head_kv_l != hparams.n_head_kv(il)) {
+                    LLAMA_LOG_ERROR("%s: mismatched n_head_kv (%u != %u, layer %u)\n",
+                                    __func__, n_head_kv_l, hparams.n_head_kv(il), il);
+                    return false;
+                }
+
+                for (uint32_t h = 0; h < n_head_kv_l; ++h) {
+                    if (sinfo.is_contiguous()) {
+                        const float * bias_data = (const float *)io.read(cell_count * sizeof(float));
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            if (bias_data[i] != 0.0f) {
+                                set_compaction_bias(il, h, sinfo.head() + i, bias_data[i]);
+                            }
+                        }
+                    } else {
+                        const float * bias_data = (const float *)io.read(cell_count * sizeof(float));
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            if (bias_data[i] != 0.0f) {
+                                set_compaction_bias(il, h, sinfo.idxs[0][i], bias_data[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2224,6 +2848,22 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::has_compaction_bias() const {
+    return kv->has_compaction_bias();
+}
+
+uint32_t llama_kv_cache_context::get_n_head() const {
+    return kv->get_n_head();
+}
+
+const float * llama_kv_cache_context::get_compaction_bias_layer(int32_t il) const {
+    return kv->get_compaction_bias_layer(il);
+}
+
+uint32_t llama_kv_cache_context::get_kv_size() const {
+    return kv->get_kv_size();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

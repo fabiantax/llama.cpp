@@ -1,5 +1,6 @@
 #include "llama.h"
 
+#include "ggml-cpp.h"
 #include "llama-impl.h"
 
 #include "llama-chat.h"
@@ -12,6 +13,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cassert>
@@ -145,10 +147,14 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
 // enum to identify part of a layer for distributing its tensors:
 enum layer_fraction_t {
     LAYER_FRACTION_NONE = 0, // nothing
-    LAYER_FRACTION_ATTN = 1, // attention
-    LAYER_FRACTION_UP   = 2, // attention + up
-    LAYER_FRACTION_GATE = 3, // attention + up + gate
+    LAYER_FRACTION_ATTN = 1, // attention stays on GPU, FFN overflows to CPU
+    LAYER_FRACTION_UP   = 2, // attention + up stay on GPU
+    LAYER_FRACTION_GATE = 3, // attention + up + gate stay on GPU
     LAYER_FRACTION_MOE  = 4, // everything but sparse MoE weights
+    // UMA-optimized: on unified memory, FFN is bandwidth-heavy and benefits more from
+    // GPU's higher effective memory bandwidth. Overflow attention to CPU instead.
+    // Inspired by APEX (arXiv:2506.03296) compute/bandwidth-aware scheduling.
+    LAYER_FRACTION_FFN  = 5, // FFN stays on GPU, attention overflows to CPU
 };
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 
@@ -177,6 +183,25 @@ static void llama_params_fit_impl(
     if (nd == 0) {
         LLAMA_LOG_INFO("%s: no devices with dedicated memory found\n", __func__);
         return;
+    }
+
+    // Check for UMA/iGPU devices. On unified memory systems, the GPU shares
+    // system RAM with the CPU, so offloading all layers is almost always optimal
+    // (GPU has higher memory bandwidth than CPU on the same memory bus).
+    bool is_uma = false;
+    {
+        bool all_igpu = true;
+        for (size_t id = 0; id < nd; id++) {
+            if (ggml_backend_dev_type(devs[id]) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                all_igpu = false;
+                break;
+            }
+        }
+        if (all_igpu) {
+            is_uma = true;
+            LLAMA_LOG_INFO("%s: all GPU devices are iGPU (unified memory) — preferring full offload\n", __func__);
+            LLAMA_LOG_INFO("%s: UMA bandwidth-aware mode: if layers must overflow, FFN stays on GPU (bandwidth-heavy)\n", __func__);
+        }
     }
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
@@ -388,6 +413,17 @@ static void llama_params_fit_impl(
                 }
                 return patterns[il].c_str();
             }
+            case LAYER_FRACTION_FFN: {
+                // UMA-optimized: overflow attention weights to CPU, keep FFN on GPU.
+                // On unified memory, FFN is bandwidth-bound (large weight matrices) and
+                // benefits more from GPU's ~2x higher effective memory bandwidth.
+                // Attention during decode is more compute-bound (small batch, large KV cache).
+                static std::array<std::string, n_strings> patterns;
+                if (patterns[il].empty()) {
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|norm|qkv|gate|q_norm|k_norm).*";
+                }
+                return patterns[il].c_str();
+            }
             default:
                 GGML_ABORT("fatal error");
         }
@@ -590,6 +626,71 @@ static void llama_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+        // UMA bandwidth-aware partial layer fitting (APEX-inspired):
+        // On unified memory, try fitting extra layers by overflowing attention to CPU
+        // while keeping FFN on GPU. FFN is bandwidth-bound (large weight matrices) and
+        // benefits more from GPU's ~2x higher effective memory bandwidth on UMA.
+        // Attention during decode is more compute-bound and tolerates CPU execution better.
+        if (is_uma && hp_nex == 0) {
+            uint32_t total_assigned = 0;
+            for (size_t id = 0; id < nd; id++) {
+                total_assigned += ngl_per_device[id].n_layer;
+            }
+
+            if (total_assigned < hp_ngl + 1) {
+                LLAMA_LOG_INFO("%s: UMA bandwidth-aware fitting: trying to fit extra layers with attention on CPU\n", __func__);
+
+                for (size_t id = 0; id < nd; id++) {
+                    // try adding one more layer with LAYER_FRACTION_FFN overflow
+                    // (FFN stays on GPU, attention overflows to CPU)
+                    std::vector<ngl_t> ngl_test = ngl_per_device;
+                    ngl_test[id].n_layer++;
+                    ngl_test[id].n_part++;
+                    ngl_test[id].overflow_type = LAYER_FRACTION_FFN;
+
+                    LLAMA_LOG_DEBUG("%s: UMA: trying device %zu with LAYER_FRACTION_FFN overflow\n", __func__, id);
+                    std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_test, overflow_bufts);
+
+                    if (mem_test[id] <= targets[id]) {
+                        ngl_per_device = ngl_test;
+                        mem = mem_test;
+                        LLAMA_LOG_INFO("%s:   UMA: fit extra layer on device %zu with attention on CPU (FFN stays on GPU)\n",
+                            __func__, id);
+
+                        // keep trying to fit more layers with the same strategy
+                        total_assigned = 0;
+                        for (size_t jd = 0; jd < nd; jd++) {
+                            total_assigned += ngl_per_device[jd].n_layer;
+                        }
+                        if (total_assigned >= hp_ngl + 1) {
+                            break;
+                        }
+                    } else {
+                        // also try the traditional ATTN overflow (FFN to CPU) for comparison
+                        ngl_test[id].overflow_type = LAYER_FRACTION_ATTN;
+                        LLAMA_LOG_DEBUG("%s: UMA: LAYER_FRACTION_FFN didn't fit, trying LAYER_FRACTION_ATTN\n", __func__);
+                        mem_test = get_memory_for_layers(__func__, ngl_test, overflow_bufts);
+                        if (mem_test[id] <= targets[id]) {
+                            ngl_per_device = ngl_test;
+                            mem = mem_test;
+                            LLAMA_LOG_INFO("%s:   UMA: fit extra layer on device %zu with FFN on CPU (fallback)\n",
+                                __func__, id);
+                        }
+                    }
+                }
+
+                // log final UMA fitting result
+                for (size_t id = 0; id < nd; id++) {
+                    if (ngl_per_device[id].n_part > 0) {
+                        const char * strategy = ngl_per_device[id].overflow_type == LAYER_FRACTION_FFN ?
+                            "FFN-on-GPU (bandwidth-aware)" : "FFN-on-CPU (fallback)";
+                        LLAMA_LOG_INFO("%s:   - device %zu: %" PRIu32 " layers (%" PRIu32 " partial, %s)\n",
+                            __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, strategy);
+                    }
+                }
+            }
+        }
+
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -825,7 +926,8 @@ int64_t llama_time_us(void) {
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
-static int llama_model_load(const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
+static int llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+        const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
     // loading time will be recalculated after the first eval, so
     // we take page faults deferred by mmap() into consideration
     model.t_load_us = 0;
@@ -834,7 +936,8 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
-        llama_model_loader ml(fname, splits, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, params.use_mmap, params.use_direct_io,
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
 
@@ -880,9 +983,13 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
 }
 
 static struct llama_model * llama_model_load_from_file_impl(
+        struct gguf_context * metadata,
+        llama_model_set_tensor_data_t set_tensor_data,
+        void * set_tensor_data_ud,
         const std::string & path_model,
         std::vector<std::string> & splits,
         struct llama_model_params params) {
+    GGML_ASSERT((metadata == nullptr) != path_model.empty() && "exactly one out of metadata and path_model needs to be defined");
     ggml_time_init();
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
@@ -1003,7 +1110,7 @@ static struct llama_model * llama_model_load_from_file_impl(
                 props.memory_free/1024/1024);
     }
 
-    const int status = llama_model_load(path_model, splits, *model, params);
+    const int status = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, *model, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -1019,6 +1126,18 @@ static struct llama_model * llama_model_load_from_file_impl(
     return model;
 }
 
+struct llama_model * llama_model_init_from_user(
+        struct gguf_context * metadata,
+        llama_model_set_tensor_data_t set_tensor_data,
+        void * set_tensor_data_ud,
+        struct llama_model_params params) {
+    GGML_ASSERT(metadata != nullptr);
+    std::string path_model;
+    std::vector<std::string> splits = {};
+    params.use_mmap = false;
+    params.use_extra_bufts = false;
+    return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, params);
+}
 // deprecated
 struct llama_model * llama_load_model_from_file(
         const char * path_model,
@@ -1030,7 +1149,7 @@ struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
-    return llama_model_load_from_file_impl(path_model, splits, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, params);
 }
 
 struct llama_model * llama_model_load_from_splits(
@@ -1046,11 +1165,11 @@ struct llama_model * llama_model_load_from_splits(
     for (size_t i = 0; i < n_paths; ++i) {
         splits.push_back(paths[i]);
     }
-    return llama_model_load_from_file_impl(splits.front(), splits, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, splits.front(), splits, params);
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
-    llama_model_saver ms(*model);
+    llama_model_saver ms(model);
     ms.add_kv_from_model();
     ms.add_tensors_from_model();
     ms.save(path_model);

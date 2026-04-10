@@ -4,6 +4,8 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-compact.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -11,7 +13,50 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <limits>
+
+// APEX runtime scheduling - inlined to avoid dependency on common/ library.
+// Full implementation in common/apex-scheduler.{h,cpp} and common/uma-profiler.{h,cpp}.
+// The llama library cannot link against common/, so we inline the minimal logic needed.
+namespace apex_inline {
+
+// Attention op names used by llama.cpp graph construction.
+static bool is_attention_op(const char * name) {
+    if (!name) return false;
+    static const char * attn_ops[] = {
+        "Qcur", "Kcur", "Vcur", "attn_out", "attn_norm",
+        "kqv", "kq", "kq_soft_max", "kqv_out", "kqv_mla",
+        "Qcur_normed", "Kcur_normed", nullptr,
+    };
+    for (const char ** op = attn_ops; *op; ++op) {
+        if (strcmp(name, *op) == 0) return true;
+    }
+    return false;
+}
+
+// Evaluate APEX critical inequality for decode workloads.
+// Returns true if CPU offload is profitable.
+static bool evaluate_offload(double T_glinear_us, double T_gatt_us) {
+    if (T_glinear_us <= 0.0 || T_gatt_us <= 0.0) return false;
+
+    // Estimate CPU attention time as 10x GPU (typical for UMA)
+    double T_catt_us = T_gatt_us * 10.0;
+
+    // APEX inequality: ratio < threshold means offload is profitable
+    double ratio     = T_gatt_us / T_catt_us;
+    double threshold = 2.0 * (T_glinear_us / T_gatt_us) + 3.0 + (T_gatt_us / T_glinear_us);
+
+    if (ratio >= threshold) return false;
+
+    // Confirm hybrid throughput > GPU-only
+    double gpu_only_time = T_glinear_us + T_gatt_us;
+    double hybrid_time   = std::max(T_glinear_us, T_catt_us);
+
+    return (1.0 / hybrid_time) > (1.0 / gpu_only_time);
+}
+
+} // namespace apex_inline
 #include <stdexcept>
 
 //
@@ -33,6 +78,13 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    // Initialize EMA expert cache for MoE models
+    if (hparams.n_expert > 0) {
+        expert_cache.init(hparams.n_layer, hparams.n_expert);
+        LLAMA_LOG_INFO("%s: expert cache initialized: %d layers, %d experts, cache_size=%d\n",
+                __func__, hparams.n_layer, hparams.n_expert, expert_cache.cache_size);
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -150,6 +202,9 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    cparams.fused_gdn_ar = true;
+    cparams.fused_gdn_ch = false; // TODO: implement
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -158,7 +213,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
-    // intialized later
+    // initialized later
     cparams.pipeline_parallel = false;
 
     {
@@ -422,7 +477,7 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fa) {
         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
         if (!gf) {
-            throw std::runtime_error("failed to split graph for Flash Attention check");
+            throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
 
         const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FATTN) + 1;
@@ -432,8 +487,7 @@ void llama_context::sched_reserve() {
             if (n->op != GGML_OP_FLASH_ATTN_EXT) {
                 continue;
             }
-            ggml_backend_dev_t device_fa = ggml_backend_get_device(
-                    ggml_backend_sched_get_tensor_backend(sched.get(), n));
+            ggml_backend_dev_t device_fa = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
 
             // TODO: instead of the tensor names, use a map to keep track of which (FA) tensors belong to which layer
             GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
@@ -448,6 +502,7 @@ void llama_context::sched_reserve() {
                 break;
             }
         }
+
         if (fa_device_mismatch) {
             cparams.flash_attn = false;
             LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", __func__);
@@ -457,6 +512,39 @@ void llama_context::sched_reserve() {
         }
 
         cparams.auto_fa = false;
+    }
+
+    if (cparams.fused_gdn_ar) {
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check");
+        }
+
+        const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FGDNAR) + 1;
+        bool gdn_device_mismatch = false;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * n = ggml_graph_node(gf, i);
+            if (n->op != GGML_OP_GATED_DELTA_NET) {
+                continue;
+            }
+            ggml_backend_dev_t device_gdn = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+
+            GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDNAR "-", prefix_len) == 0);
+            const int il = std::stoi(n->name + prefix_len);
+            ggml_backend_dev_t device_kv = model.dev_layer(il);
+            if (device_gdn != device_kv) {
+                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
+                        "is assigned to device %s (usually due to missing support)\n",
+                        __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
+                gdn_device_mismatch = true;
+                break;
+            }
+        }
+
+        if (gdn_device_mismatch) {
+            cparams.fused_gdn_ar = false;
+            LLAMA_LOG_WARN("%s: fused Gated Delta Net not supported, set to disabled\n", __func__);
+        }
     }
 
     // reserve worst-case graph
@@ -1039,16 +1127,24 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
-    if (n_adapters != loras->size()) {
-        return false;
-    }
+    // Adapters with a zero scale are never added to `loras`, so also ignore them for the comparison.
+    size_t n_non_zero = 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
+        if (scales[i] == 0.0f) {
+            continue;
+        }
+        n_non_zero++;
+
         auto it = loras->find(adapters[i]);
 
         if (it == loras->end() || it->second != scales[i]) {
             return false;
         }
+    }
+
+    if (n_non_zero != loras->size()) {
+        return false;
     }
 
     return true;
@@ -1066,6 +1162,14 @@ bool llama_context::set_adapter_cvec(
 
     return cvec->apply(model, data, len, n_embd, il_start, il_end);
 }
+
+// Q capture eval callback infrastructure (used by process_ubatch when Q capture is enabled)
+struct q_capture_context {
+    llama_kv_cache * kv;
+    ggml_backend_sched_eval_callback user_cb;
+    void * user_cb_data;
+};
+static bool q_capture_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
@@ -1089,7 +1193,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        // determine eval callback: wrap with Q capture if enabled
+        {
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (kv && kv->get_q_capture()) {
+                static thread_local q_capture_context qctx;
+                qctx.kv           = kv;
+                qctx.user_cb      = cparams.cb_eval;
+                qctx.user_cb_data = cparams.cb_eval_user_data;
+                ggml_backend_sched_set_eval_callback(sched.get(), q_capture_eval_callback, &qctx);
+            } else {
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            }
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1114,6 +1231,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        // Set dynamic EMA expert cache bias before compute (MoE only)
+        if (expert_cache.enabled && has_evaluated_once) {
+            const auto & hp = model.hparams;
+            std::vector<const float *> bias_ptrs(hp.n_layer, nullptr);
+            std::vector<std::vector<float>> bias_storage(hp.n_layer);
+            for (int il = 0; il < hp.n_layer; il++) {
+                auto bias = expert_cache.compute_bias_vec(il);
+                if (std::any_of(bias.begin(), bias.end(), [](float v) { return v > 0.0f; })) {
+                    bias_storage[il] = std::move(bias);
+                    bias_ptrs[il] = bias_storage[il].data();
+                }
+            }
+            llama_set_expert_cache_bias(const_cast<llama_model *>(&model), bias_ptrs.data(), hp.n_layer);
+        }
+
+        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1124,6 +1257,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // Update EMA expert cache from selected expert IDs (MoE decode steps only)
+    if (expert_cache.enabled && gtype == LLM_GRAPH_TYPE_DECODE) {
+        const auto & hp = model.hparams;
+        auto * gf = res->get_gf();
+        for (int il = 0; il < hp.n_layer; il++) {
+            struct ggml_tensor * t = ggml_graph_get_tensor(gf, ("ffn_moe_topk-" + std::to_string(il)).c_str());
+            if (t && t->data) {
+                const int32_t * ids = (const int32_t *)t->data;
+                // t->ne[0] = n_tokens, t->ne[1] = n_expert_used
+                const int n_expert_used = t->ne[1];
+                expert_cache.update(il, ids, n_expert_used);
+            }
+        }
+        has_evaluated_once = true;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1499,7 +1648,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     sched_reserve();
 
-    bool did_optimize = false;
+    bool did_optimize      = false;
+    bool did_auto_compact  = false;
 
     // handle any pending shifts/copies
     memory_update(false);
@@ -1531,6 +1681,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
+                        }
+                    }
+
+                    // try auto-compaction if enabled (KV cache specific)
+                    if (!did_auto_compact) {
+                        did_auto_compact = true;
+
+                        auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+                        if (kv && kv->get_auto_compact_enabled()) {
+                            if (kv->try_auto_compact(this)) {
+                                LLAMA_LOG_DEBUG("%s: retrying batch size %d after auto-compaction\n", __func__, balloc->get_n_tokens());
+                                continue;
+                            }
                         }
                     }
 
@@ -1759,6 +1922,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // APEX: evaluate scheduling after profiling warmup completes.
+    // The profiler data is communicated via apex_set_profiler_results() called from common/.
+    // Here we just check if we have pending results to evaluate.
+    if (!apex_profiling_done && apex_policy_state.pending_ffn_us > 0.0) {
+        apex_profiling_done = true;
+
+        double avg_ffn_us  = apex_policy_state.pending_ffn_us;
+        double avg_attn_us = apex_policy_state.pending_attn_us;
+
+        bool offload = apex_inline::evaluate_offload(avg_ffn_us, avg_attn_us);
+
+        if (offload) {
+            apex_policy_state.active              = true;
+            apex_policy_state.offload_start_layer = 0;
+            apex_policy_state.offload_end_layer   = model.hparams.n_layer - 1;
+
+            LLAMA_LOG_INFO("%s: APEX gate: offload=yes (ffn=%.1f us, attn=%.1f us)\n",
+                __func__, avg_ffn_us, avg_attn_us);
+            LLAMA_LOG_INFO("%s: APEX: offloading attention to CPU for layers %d-%d\n",
+                __func__, apex_policy_state.offload_start_layer, apex_policy_state.offload_end_layer);
+        } else {
+            LLAMA_LOG_INFO("%s: APEX gate: offload=no (ffn=%.1f us, attn=%.1f us) — GPU-only\n",
+                __func__, avg_ffn_us, avg_attn_us);
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -1981,7 +2170,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sched.get());
 
-    // when the scheduler is reset, we cannnot reuse the old graph, so we reset the previous graph result to prevent that
+    // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
 
     // store the n_outputs as it is, and restore it afterwards
@@ -2045,6 +2234,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.model       =*/ &model,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2100,6 +2290,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }
+                    }
+                }
+            }
+        }
+
+        // APEX-driven attention offload to CPU (UMA bandwidth-aware scheduling)
+        // When the APEX inequality gate determines CPU offload is profitable,
+        // route attention ops to CPU backend to free GPU for bandwidth-heavy FFN.
+        if (apex_policy_state.active && il >= 0) {
+            if (il >= apex_policy_state.offload_start_layer &&
+                (apex_policy_state.offload_end_layer < 0 || il <= apex_policy_state.offload_end_layer)) {
+                if (apex_inline::is_attention_op(name)) {
+                    if (backend_cpu && ggml_backend_supports_op(backend_cpu, cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
                     }
                 }
             }
@@ -3160,12 +3364,142 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+void llama_memory_set_attn_bias(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+         const float * bias_data,
+             int32_t   n) {
+    if (!mem) {
+        return;
+    }
+    mem->set_attn_bias(seq_id, bias_data, n);
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;
     }
 
     return mem->get_can_shift();
+}
+
+// KV cache compaction API
+
+struct llama_compact_params llama_compact_params_default(void) {
+    return {
+        /*.target_ratio           =*/ 0.5f,
+        /*.n_ref_queries          =*/ 0,
+        /*.use_repeat_prefill     =*/ false,
+        /*.use_nonuniform_budgets =*/ false,
+        /*.budget_profile_path    =*/ nullptr,
+    };
+}
+
+int32_t llama_kv_cache_compact(
+             struct llama_context * ctx,
+                       llama_seq_id seq_id,
+        struct llama_compact_params params) {
+    return llama_kv_compact_impl(ctx, seq_id, params);
+}
+
+static bool q_capture_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * qctx = static_cast<q_capture_context *>(user_data);
+
+    // check if this is a Qcur tensor (named "Qcur-{layer}")
+    const char * name = t->name;
+    bool is_qcur = (strncmp(name, "Qcur-", 5) == 0);
+
+    // also handle backend-prefixed names like "CUDA0#Qcur-0#0"
+    if (!is_qcur) {
+        const char * hash = strchr(name, '#');
+        if (hash) {
+            is_qcur = (strncmp(hash + 1, "Qcur-", 5) == 0);
+            if (is_qcur) {
+                name = hash + 1; // point to "Qcur-..."
+            }
+        }
+    }
+
+    if (ask) {
+        // we want data from Qcur tensors
+        if (is_qcur) return true;
+        // chain to user callback
+        if (qctx->user_cb) return qctx->user_cb(t, ask, qctx->user_cb_data);
+        return false;
+    }
+
+    // data pass (ask == false)
+    if (is_qcur) {
+        // parse layer index from name "Qcur-{il}"
+        const char * dash = strchr(name, '-');
+        if (dash) {
+            int il = atoi(dash + 1);
+
+            // Q tensor shape: [n_embd_head, n_head, n_tokens] (ggml layout)
+            // ne[0] = n_embd_head, ne[1] = n_head, ne[2] = n_tokens
+            const uint32_t n_embd_head = t->ne[0];
+            const uint32_t n_head      = t->ne[1];
+            const uint32_t n_tokens    = t->ne[2];
+
+            // read tensor data to CPU
+            const size_t nbytes = ggml_nbytes(t);
+            std::vector<float> q_data(n_tokens * n_head * n_embd_head);
+
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, q_data.data(), 0, nbytes);
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n_tokens * n_head * n_embd_head);
+                ggml_backend_tensor_get(t, tmp.data(), 0, nbytes);
+                for (size_t i = 0; i < tmp.size(); ++i) {
+                    q_data[i] = ggml_fp16_to_fp32(tmp[i]);
+                }
+            } else {
+                // for other types, dequantize
+                std::vector<uint8_t> raw(nbytes);
+                ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
+                ggml_get_type_traits(t->type)->to_float(raw.data(), q_data.data(),
+                    n_tokens * n_head * n_embd_head);
+            }
+
+            // ggml tensor is [n_embd_head, n_head, n_tokens] but we need row-major
+            // [n_tokens, n_head, n_embd_head] for storage
+            // the data from ggml_backend_tensor_get is contiguous in ggml order:
+            // fastest dim = ne[0] = n_embd_head, then ne[1] = n_head, then ne[2] = n_tokens
+            // so it's already: for each token, for each head, n_embd_head floats
+            // which is [n_tokens][n_head][n_embd_head] in row-major — exactly what we want
+
+            qctx->kv->store_captured_q(il, q_data.data(), n_tokens, n_head, n_embd_head);
+        }
+    }
+
+    // chain to user callback
+    if (qctx->user_cb) return qctx->user_cb(t, ask, qctx->user_cb_data);
+    return true;
+}
+
+void llama_kv_cache_capture_q(
+        struct llama_context * ctx,
+                          bool enable) {
+    auto * memory = ctx->get_memory();
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: memory type is not llama_kv_cache\n", __func__);
+        return;
+    }
+    kv->set_q_capture(enable);
+}
+
+void llama_kv_cache_set_auto_compact(
+        struct llama_context * ctx,
+                       float   threshold,
+  struct llama_compact_params   params) {
+    auto * memory = ctx->get_memory();
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: memory type is not llama_kv_cache\n", __func__);
+        return;
+    }
+    kv->set_auto_compact(threshold, params);
 }
 
 // llama state API

@@ -27,6 +27,80 @@ LLM inference in C/C++
 - Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
 - Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
 
+## KV Cache Compaction Roadmap
+
+Target: **500 t/s aggregate throughput** via Attention Matching KV cache compression (up to 50x) on AMD Strix Halo.
+Based on ["Fast KV Compaction via Attention Matching" (Zweiger et al., 2026)](https://arxiv.org/abs/2602.16284).
+
+```mermaid
+timeline
+    title KV Cache Compaction — Development Roadmap
+    section Phase 1 — Foundation
+        Documentation & Research
+            : Algorithm reference (560 lines)
+            : Attention matching paper breakdown (307 lines)
+            : Design rationale & improvement opportunities (508 lines)
+            : Gap analysis & architecture mapping
+        Math Library (kv-compact-math.h)
+            : mat_mul, softmax, exp stable primitives
+            : NNLS solver (projected gradient, 200 iter)
+            : Regularized least-squares solver (Gauss elim + pivot)
+            : compact_head_highest_attn 3-step pipeline
+        Unit Tests (21 tests)
+            : Matrix ops, softmax, NNLS, LS, full pipeline
+    section Phase 2 — Core Integration
+        Beta (Bias) Injection Pipeline
+            : Bias storage in llama_kv_cache (per-layer, per-head)
+            : Bias tensor creation in attention graph [n_kv, 1, n_head_kv, n_stream]
+            : Pre-softmax injection via ggml_add(kq, bias)
+            : Serialization (save/load) & defrag-aware remapping
+        C_v Writeback
+            : Least-squares fitted values written to V tensors
+            : write_v_compact() integrated with cell metadata
+        Full Model Compaction (llama-kv-compact.cpp)
+            : All layers x all heads loop
+            : Compaction API on llama_kv_cache
+            : Flash attention disabled when bias active
+    section Phase 3 — Quality (In Progress)
+        Q Vector Capture
+            : API exists (has_captured_q / get_captured_q)
+            : Producer during llama_decode not yet wired
+            : Replaces K-proxy with true query vectors
+        Diversity-Aware Key Selection
+            : Redundancy penalty for selected keys
+            : Captures OMP benefit at HighestAttn speed
+        Reconstruction Error Metric
+            : Replace variance proxy with actual compression loss
+    section Phase 4 — Optimization (Planned)
+        Iterative Key Refinement
+            : Steps 1-2-3 then re-score and swap worst keys
+            : 2-3 iterations for improved selection quality
+        GCV Ridge Selection
+            : Replace fixed two-tier ridge (1e-4 vs 1.0)
+            : Per-head optimal lambda via generalized cross-validation
+        Non-Uniform Head Budgets
+            : Sensitivity profiling (one-time per model)
+            : Greedy exchange budget allocation
+            : Most impactful component per paper ablations
+    section Phase 5 — Production (Planned)
+        Library API (llama.h)
+            : llama_kv_cache_compact(ctx, seq_id, ratio, params)
+            : Configurable ref queries, budgets, repeat-prefill
+        Online Compaction
+            : Auto-trigger at cache fill threshold (90%)
+            : Supports 6 consecutive compressions (per paper)
+            : Critical for multi-agent tool-heavy workloads
+        Flash Attention + Bias Kernel
+            : Custom kernel for FA with per-key bias
+            : Recover 10-20% speed lost from FA disable
+        Multi-Stream Batching
+            : 8-16 concurrent agent sessions
+            : Shared prefill amortization
+            : Target 500+ t/s aggregate throughput
+```
+
+See [docs/kv-cache-compaction-algorithms.md](docs/kv-cache-compaction-algorithms.md) for algorithm details and [docs/kv-cache-compaction-rationale.md](docs/kv-cache-compaction-rationale.md) for design rationale.
+
 ----
 
 ## Quick start
@@ -259,6 +333,8 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 - [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
 - [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
 - [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
+- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
+  support"
 </details>
 
 <details>
@@ -287,7 +363,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
 | [WebGPU [In Progress]](docs/build.md#webgpu) | All |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [Hexagon [In Progress]](docs/backend/hexagon/README.md) | Snapdragon |
+| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
 
 ## Obtaining and quantizing models

@@ -197,7 +197,113 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    void set_attn_bias(llama_seq_id seq_id, const float * bias_data, int32_t n) override;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    //
+    // compaction API
+    //
+
+    // returns true if any layer/head has compaction bias set
+    bool has_compaction_bias() const;
+
+    // set compaction bias for a specific layer, head, and cell position
+    // bias is added to attention scores (pre-softmax) for compacted keys
+    void set_compaction_bias(int32_t il, uint32_t head_kv, uint32_t cell_idx, float beta);
+
+    // clear all compaction biases (e.g. after cache clear or full recomputation)
+    void clear_compaction_bias();
+
+    // get per-layer compaction bias data for a given model layer
+    // returns pointer to [n_head_kv * kv_size] floats, or nullptr if no bias for this layer
+    const float * get_compaction_bias_layer(int32_t il) const;
+
+    // get the number of KV heads for bias indexing
+    uint32_t get_n_head_kv() const;
+
+    // get n_head (query heads) — used for per-head mask expansion
+    uint32_t get_n_head() const;
+
+    // get the kv_size for bias indexing
+    uint32_t get_kv_size() const;
+
+    // write compacted K data back to cache for a specific layer and head
+    // k_data: [n_kept, n_embd_head_k] in F32
+    // kept_indices: original cell indices that were kept (size n_kept)
+    void write_k_compact(int32_t il, uint32_t head_kv,
+                         const float * k_data, const uint32_t * kept_indices, uint32_t n_kept);
+
+    // write compacted V data (C_v) back to cache for a specific layer and head
+    // v_data: [n_kept, n_embd_head_v] in F32
+    // kept_indices: original cell indices that were kept (size n_kept)
+    void write_v_compact(int32_t il, uint32_t head_kv,
+                         const float * v_data, const uint32_t * kept_indices, uint32_t n_kept);
+
+    // after compaction: evict cells not in kept set
+    // kept_indices: sorted array of cell indices to keep (size n_kept)
+    // stream: the stream index to compact
+    void compact_cells(const uint32_t * kept_indices, uint32_t n_kept, uint32_t stream);
+
+    // defragment: move kept cells to contiguous positions [0, n_kept)
+    // must be called AFTER compact_cells or when cells are scattered
+    // moves K/V tensor data and updates cell metadata + compaction bias
+    // returns mapping: defrag_map[old_cell_idx] = new_cell_idx (only for kept cells)
+    void defrag_after_compact(uint32_t stream);
+
+    // get raw K/V tensors for a model layer (for reading data during compaction)
+    ggml_tensor * get_k_raw(int32_t il) const;
+    ggml_tensor * get_v_raw(int32_t il) const;
+
+    // check if V is transposed
+    bool get_v_trans() const;
+
+    // get number of active cells in a stream
+    uint32_t get_used_cells(uint32_t stream) const;
+
+    // get cell position for a cell index
+    llama_pos get_cell_pos(uint32_t stream, uint32_t cell_idx) const;
+
+    // check if cell is empty
+    bool is_cell_empty(uint32_t stream, uint32_t cell_idx) const;
+
+    //
+    // Q capture API (for repeat-prefill reference queries)
+    //
+
+    // enable/disable Q vector capture during decode
+    void set_q_capture(bool enable);
+    bool get_q_capture() const;
+
+    // store captured Q vectors for a model layer
+    // q_data: [n_tokens, n_head, n_embd_head_k] in F32
+    void store_captured_q(int32_t il, const float * q_data, uint32_t n_tokens, uint32_t n_head, uint32_t n_embd_head);
+
+    // check if captured Q vectors are available for a model layer
+    bool has_captured_q(int32_t il) const;
+
+    // get captured Q vectors for a model layer
+    // returns pointer to [n_q, n_embd_head_k] data (one KV head's worth, GQA-collapsed)
+    // n_q is returned via out_n_q
+    const float * get_captured_q(int32_t il, uint32_t head_kv, uint32_t * out_n_q) const;
+
+    // clear all captured Q vectors
+    void clear_captured_q();
+
+    //
+    // auto-compaction API
+    //
+
+    // configure automatic compaction when cache fills beyond threshold
+    void set_auto_compact(float threshold, llama_compact_params params);
+
+    // check if auto-compaction is enabled
+    bool get_auto_compact_enabled() const;
+
+    // attempt auto-compaction if conditions are met (called from decode path)
+    // ctx: context needed for compaction algorithm
+    // returns true if compaction was performed and slots may now be available
+    bool try_auto_compact(llama_context * ctx);
 
 private:
     const llama_model & model;
@@ -251,6 +357,31 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // compaction bias storage (CPU-side)
+    // indexed as: compaction_bias[kv_layer_id][head_kv * kv_size + cell_idx]
+    // values are added to attention scores (pre-softmax) for compacted keys
+    std::vector<std::vector<float>> compaction_bias;
+    bool compaction_bias_active = false; // fast check to skip bias logic when no biases set
+
+    // auto-compaction configuration
+    // when enabled, compaction is triggered automatically when the cache fills
+    // beyond the threshold during init_batch (before returning FAILED_PREPARE)
+    bool     auto_compact_enabled   = false;
+    float    auto_compact_threshold = 0.9f;  // fraction of kv_size at which to trigger
+    llama_compact_params auto_compact_params = {};
+
+    // Q capture storage (CPU-side)
+    // when q_capture_active is true, Q vectors are captured during decode via eval callback
+    // indexed as: captured_q[kv_layer_id] = flat array of [n_tokens * n_head * n_embd_head_k]
+    bool q_capture_enabled = false;
+    struct captured_q_layer {
+        std::vector<float> data;   // [n_tokens * n_head * n_embd_head_k]
+        uint32_t n_tokens   = 0;
+        uint32_t n_head     = 0;   // query heads (not KV heads)
+        uint32_t n_embd_head = 0;
+    };
+    std::vector<captured_q_layer> captured_q;
 
     size_t total_size() const;
 
@@ -326,6 +457,18 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // returns true if the underlying cache has compaction bias values
+    bool has_compaction_bias() const;
+
+    // get n_head (query heads) for compaction bias mask expansion
+    uint32_t get_n_head() const;
+
+    // get per-layer compaction bias data for a given model layer
+    const float * get_compaction_bias_layer(int32_t il) const;
+
+    // get the total kv cache allocation size (for bias indexing stride)
+    uint32_t get_kv_size() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

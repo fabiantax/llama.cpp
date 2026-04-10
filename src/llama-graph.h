@@ -308,6 +308,16 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // per-layer compaction bias tensors (added to KQ before softmax)
+    // shape per layer: [n_kv, 1, n_head_kv(il), 1] — broadcasts across tokens and streams
+    // only populated when compaction bias is active
+    std::map<int32_t, ggml_tensor *> self_compaction_bias;
+
+    ggml_tensor * get_compaction_bias(int32_t il) const {
+        auto it = self_compaction_bias.find(il);
+        return it != self_compaction_bias.end() ? it->second : nullptr;
+    }
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -501,6 +511,23 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// Cache-aware expert routing bias input (arxiv 2412.00099)
+class llm_graph_input_expert_cache_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_expert_cache_bias(const struct llama_model * model, int il, int64_t n_expert)
+        : model(model), il(il), n_expert(n_expert) {}
+    virtual ~llm_graph_input_expert_cache_bias() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * bias = nullptr; // F32 [n_expert]
+
+private:
+    const struct llama_model * model;
+    int il;
+    int64_t n_expert;
+};
+
 //
 // llm_graph_result
 //
@@ -533,6 +560,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const struct llama_model     * model = nullptr; // for expert_cache_bias
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -744,6 +772,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const struct llama_model * model; // for expert_cache_bias
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -810,7 +840,6 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
          llm_ffn_op_type   type_op,
                     bool   norm_w,
-                    bool   scale_w,
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,
@@ -832,7 +861,6 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
          llm_ffn_op_type   type_op,
                     bool   norm_w,
-                    bool   scale_w,
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,
@@ -869,7 +897,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * compaction_kq_bias = nullptr) const; // per-layer compaction bias [n_kv, 1, n_head_kv, 1]
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

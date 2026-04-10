@@ -47,10 +47,10 @@ add_library(${TARGET} STATIC
     arg.cpp
     arg.h
     base64.hpp
-    chat-parser.cpp
-    chat-parser.h
-    chat-parser-xml-toolcall.h
-    chat-parser-xml-toolcall.cpp
+    chat-auto-parser-generator.cpp
+    chat-auto-parser-helpers.cpp
+    chat-auto-parser.h
+    chat-diff-analyzer.cpp
     chat-peg-parser.cpp
     chat-peg-parser.h
     chat.cpp
@@ -72,6 +72,10 @@ add_library(${TARGET} STATIC
     log.h
     ngram-cache.cpp
     ngram-cache.h
+    uma-profiler.cpp
+    uma-profiler.h
+    apex-scheduler.cpp
+    apex-scheduler.h
     ngram-map.cpp
     ngram-map.h
     ngram-mod.cpp

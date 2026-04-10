@@ -1,0 +1,22 @@
+target/
+.cargo/
+*.exe
+*.dll
+*.pdb
+
+# Exclude all ONNX variants except int8 (saves ~2.3 GB in build context)
+models/gliner_small-v2.1/onnx/model.onnx
+models/gliner_small-v2.1/onnx/model_bnb4.onnx
+models/gliner_small-v2.1/onnx/model_fp16.onnx
+models/gliner_small-v2.1/onnx/model_q4.onnx
+models/gliner_small-v2.1/onnx/model_q4f16.onnx
+models/gliner_small-v2.1/onnx/model_quantized.onnx
+models/gliner_small-v2.1/onnx/model_uint8.onnx
+models/gliner_small-v2.1/.cache/
+
+# Sources are mounted, not baked in
+sources/
+
+# Node/JS artifacts
+node_modules/
+extract.mjs

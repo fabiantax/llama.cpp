@@ -5,6 +5,7 @@
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
+#include "uma-profiler.h"
 #include "unicode.h"
 
 #include <algorithm>
@@ -676,7 +677,7 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
 
     size_t offset = 0;
     while (offset < filename.size()) {
-        utf8_parse_result result = parse_utf8_codepoint(filename, offset);
+        utf8_parse_result result = common_parse_utf8_codepoint(filename, offset);
 
         if (result.status != utf8_parse_result::SUCCESS) {
             return false;
@@ -1041,10 +1042,68 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    // UMA bandwidth-aware profiler (APEX-inspired)
+    std::unique_ptr<uma_profiler_data> uma_profiler;
 };
 
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
+
+    // Detect UMA/iGPU devices and apply optimal defaults before model loading.
+    // On unified memory systems (e.g., AMD Strix Halo, Apple Silicon), CPU and GPU
+    // share memory bandwidth. This auto-configuration ensures optimal settings:
+    //   - Disable mmap for large models (HIP mmap copy is very slow on UMA)
+    //   - Reduce CPU thread count to avoid bandwidth contention with GPU
+    //   - Recommend full GPU offload
+    {
+        bool has_igpu = false;
+        bool has_dgpu = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            auto dev_type = ggml_backend_dev_type(dev);
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                has_igpu = true;
+            } else if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                has_dgpu = true;
+            }
+        }
+
+        if (has_igpu && !has_dgpu) {
+            LOG_INF("%s: iGPU (unified memory) detected — applying UMA-optimized defaults\n", __func__);
+
+            // Auto-disable mmap: on UMA systems with HIP, hipMemcpy from mmap'd
+            // pages requires expensive page locking. --no-mmap is always faster.
+            if (params.use_mmap) {
+                LOG_INF("%s:   disabling mmap (--no-mmap) for UMA — avoids slow HIP page locking\n", __func__);
+                params.use_mmap = false;
+            }
+
+            // Reduce CPU thread count for GPU-primary inference to avoid competing
+            // for shared memory bandwidth. Only adjust if user didn't explicitly set -t.
+            if (params.cpuparams.n_threads < 0 && params.n_gpu_layers != 0) {
+                const int n_phys = cpu_get_num_physical_cores();
+                // Use 25% of physical cores (min 2, max 8) during GPU inference
+                const int uma_threads = std::max(2, std::min(8, n_phys / 4));
+                params.cpuparams.n_threads = uma_threads;
+                LOG_INF("%s:   setting thread count to %d (of %d physical cores) to reduce bandwidth contention\n",
+                    __func__, uma_threads, n_phys);
+            }
+
+            // UMA bandwidth profiler DISABLED — causes 5x server regression.
+            // The cb_eval callback fires on every op of every token, adding massive
+            // overhead. Even after the 5-iteration profiling window, the callback
+            // remains registered and continues firing (checking profiling_active flag).
+            // TODO: Only enable when explicitly requested via --uma-profile flag.
+            if (false && !params.cb_eval && params.verbosity >= 1) {
+                LOG_INF("%s:   UMA profiler enabled — will analyze bandwidth utilization for first 5 iterations\n", __func__);
+                pimpl->uma_profiler = std::make_unique<uma_profiler_data>();
+                params.cb_eval = uma_profiler_cb_eval;
+                params.cb_eval_user_data = pimpl->uma_profiler.get();
+            }
+        }
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1281,6 +1340,27 @@ common_init_result_ptr common_init_from_params(common_params & params) {
 }
 
 common_init_result::~common_init_result() = default;
+
+std::string common_init_result::uma_profiler_get_report() {
+    if (pimpl->uma_profiler) {
+        return uma_profiler_report(*pimpl->uma_profiler);
+    }
+    return "";
+}
+
+void common_init_result::uma_profiler_on_iteration() {
+    if (pimpl->uma_profiler) {
+        uma_profiler_iteration_done(*pimpl->uma_profiler);
+        // auto-print report when profiling completes
+        if (!pimpl->uma_profiler->profiling_active && pimpl->uma_profiler->n_iterations > 0) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                LOG_INF("%s", uma_profiler_report(*pimpl->uma_profiler).c_str());
+            }
+        }
+    }
+}
 
 std::string get_model_endpoint() {
     const char * model_endpoint_env = getenv("MODEL_ENDPOINT");

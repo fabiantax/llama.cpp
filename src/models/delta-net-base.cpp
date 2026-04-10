@@ -1,6 +1,6 @@
 #include "models.h"
 
-#define CHUNK_SIZE 64
+#include "llama-impl.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -41,6 +41,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
+    if (cparams.fused_gdn_ch) {
+        //ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+        //cb(result, LLAMA_TENSOR_NAME_FGDNCH, il);
+
+        GGML_ABORT("not implemented yet");
+    }
+
     const float scale = 1.0f / sqrtf(S_k);
 
     q = ggml_scale(ctx0, q, scale);
@@ -57,7 +64,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     g = ggml_permute(ctx0, g, 0, 2, 1, 3); // [g_0, n_tokens, H_v, n_seqs]
     b = ggml_permute(ctx0, b, 0, 2, 1, 3); // [  1, n_tokens, H_v, n_seqs]
 
-    const int CS = CHUNK_SIZE;
+    const int CS = kda ? 16 : 64; // chunk size
 
     const int pad = (CS - n_tokens % CS) % CS;
     const int n_chunks = (n_tokens + pad) / CS;
@@ -318,8 +325,61 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
+    if (cparams.fused_gdn_ar) {
+        ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+        cb(result, LLAMA_TENSOR_NAME_FGDNAR, il);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, result,
+            S_v, H_v, n_tokens, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+        ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+        return {output, new_state};
+    }
+
     const float scale = 1.0f / sqrtf(S_k);
 
+    // Use fused Delta-Net recurrence kernel for GDA when H_k == H_v (after GQA expansion)
+    if (g->ne[0] == 1 && H_k == H_v) {
+        // Scale q before fused op
+        q = ggml_scale(ctx0, q, scale);
+
+        // Ensure all inputs are contiguous (server batching may pass views)
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        if (!ggml_is_contiguous(k)) { k = ggml_cont(ctx0, k); }
+        if (!ggml_is_contiguous(v)) { v = ggml_cont(ctx0, v); }
+        if (!ggml_is_contiguous(g)) { g = ggml_cont(ctx0, g); }
+        if (!ggml_is_contiguous(b)) { b = ggml_cont(ctx0, b); }
+
+        // q/k/v are [S, H, 1, n_seqs], gate/beta are [1, H, 1, n_seqs]
+        // state is [S, S, H, n_seqs]
+        ggml_tensor * result = ggml_delta_net_recurrence(ctx0, q, k, v, g, b, s);
+
+        // Extract output: first S*H*n_seqs floats
+        const int64_t o_size = S_v * H_v * n_seqs;
+        ggml_tensor * o = ggml_view_1d(ctx0, result, o_size, 0);
+        o = ggml_reshape_4d(ctx0, o, S_v, H_v, n_tokens, n_seqs);
+
+        // Extract new state: remaining S*S*H*n_seqs floats
+        const int64_t s_size = S_v * S_v * H_v * n_seqs;
+        const size_t  s_off  = o_size * sizeof(float);
+        ggml_tensor * s_new = ggml_view_1d(ctx0, result, s_size, s_off);
+        s_new = ggml_reshape_4d(ctx0, s_new, S_v, S_v, H_v, n_seqs);
+
+        cb(s_new, "dnet_add_ar_state", il);
+
+        return {o, s_new};
+    }
+
+    // Fallback: unfused implementation (KDA or GQA not expanded)
     q = ggml_scale(ctx0, q, scale);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3); // [S_k, n_tokens, H_k, n_seqs]
