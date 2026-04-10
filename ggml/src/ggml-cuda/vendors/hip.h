@@ -78,6 +78,7 @@
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
+#define cudaMemPrefetchAsync hipMemPrefetchAsync
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
@@ -205,6 +206,9 @@
 
 #if defined(__GFX11__)
 #define RDNA3
+#if defined(__gfx1150__) || defined(__gfx1151__)
+#define RDNA3_5
+#endif // defined(__gfx1150__) || defined(__gfx1151__)
 #endif // defined(__GFX11__)
 
 #if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \

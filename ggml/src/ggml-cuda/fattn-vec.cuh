@@ -10,7 +10,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
     return 128;
 }
 
-// Currenlty llvm with the amdgcn target does not support unrolling loops
+// Currently llvm with the amdgcn target does not support unrolling loops
 // that contain a break that can not be resolved at compile time.
 #ifdef __clang__
 #pragma clang diagnostic push
@@ -63,7 +63,9 @@ static __global__ void flash_attn_ext_vec(
     constexpr int cpy_ne = cpy_nb / 4;
 
 #ifdef GGML_USE_HIP
-#ifdef RDNA
+#if defined(RDNA3_5)
+    constexpr int nthreads_KQ_q = 4;
+#elif defined(RDNA)
     constexpr int nthreads_KQ_q = 2;
 #else
     constexpr int nthreads_KQ_q = 4;

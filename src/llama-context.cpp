@@ -12,6 +12,48 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+
+// APEX runtime scheduling - inlined to avoid dependency on common/ library.
+// Full implementation in common/apex-scheduler.{h,cpp} and common/uma-profiler.{h,cpp}.
+// The llama library cannot link against common/, so we inline the minimal logic needed.
+namespace apex_inline {
+
+// Attention op names used by llama.cpp graph construction.
+static bool is_attention_op(const char * name) {
+    if (!name) return false;
+    static const char * attn_ops[] = {
+        "Qcur", "Kcur", "Vcur", "attn_out", "attn_norm",
+        "kqv", "kq", "kq_soft_max", "kqv_out", "kqv_mla",
+        "Qcur_normed", "Kcur_normed", nullptr,
+    };
+    for (const char ** op = attn_ops; *op; ++op) {
+        if (strcmp(name, *op) == 0) return true;
+    }
+    return false;
+}
+
+// Evaluate APEX critical inequality for decode workloads.
+// Returns true if CPU offload is profitable.
+static bool evaluate_offload(double T_glinear_us, double T_gatt_us) {
+    if (T_glinear_us <= 0.0 || T_gatt_us <= 0.0) return false;
+
+    // Estimate CPU attention time as 10x GPU (typical for UMA)
+    double T_catt_us = T_gatt_us * 10.0;
+
+    // APEX inequality: ratio < threshold means offload is profitable
+    double ratio     = T_gatt_us / T_catt_us;
+    double threshold = 2.0 * (T_glinear_us / T_gatt_us) + 3.0 + (T_gatt_us / T_glinear_us);
+
+    if (ratio >= threshold) return false;
+
+    // Confirm hybrid throughput > GPU-only
+    double gpu_only_time = T_glinear_us + T_gatt_us;
+    double hybrid_time   = std::max(T_glinear_us, T_catt_us);
+
+    return (1.0 / hybrid_time) > (1.0 / gpu_only_time);
+}
+
+} // namespace apex_inline
 #include <stdexcept>
 
 //
@@ -150,6 +192,9 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    cparams.fused_gdn_ar = true;
+    cparams.fused_gdn_ch = false; // TODO: implement
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -158,7 +203,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
-    // intialized later
+    // initialized later
     cparams.pipeline_parallel = false;
 
     {
@@ -422,7 +467,7 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fa) {
         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
         if (!gf) {
-            throw std::runtime_error("failed to split graph for Flash Attention check");
+            throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
 
         const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FATTN) + 1;
@@ -432,8 +477,7 @@ void llama_context::sched_reserve() {
             if (n->op != GGML_OP_FLASH_ATTN_EXT) {
                 continue;
             }
-            ggml_backend_dev_t device_fa = ggml_backend_get_device(
-                    ggml_backend_sched_get_tensor_backend(sched.get(), n));
+            ggml_backend_dev_t device_fa = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
 
             // TODO: instead of the tensor names, use a map to keep track of which (FA) tensors belong to which layer
             GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
@@ -448,6 +492,7 @@ void llama_context::sched_reserve() {
                 break;
             }
         }
+
         if (fa_device_mismatch) {
             cparams.flash_attn = false;
             LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", __func__);
@@ -457,6 +502,39 @@ void llama_context::sched_reserve() {
         }
 
         cparams.auto_fa = false;
+    }
+
+    if (cparams.fused_gdn_ar) {
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check");
+        }
+
+        const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FGDNAR) + 1;
+        bool gdn_device_mismatch = false;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * n = ggml_graph_node(gf, i);
+            if (n->op != GGML_OP_GATED_DELTA_NET) {
+                continue;
+            }
+            ggml_backend_dev_t device_gdn = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+
+            GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDNAR "-", prefix_len) == 0);
+            const int il = std::stoi(n->name + prefix_len);
+            ggml_backend_dev_t device_kv = model.dev_layer(il);
+            if (device_gdn != device_kv) {
+                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
+                        "is assigned to device %s (usually due to missing support)\n",
+                        __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
+                gdn_device_mismatch = true;
+                break;
+            }
+        }
+
+        if (gdn_device_mismatch) {
+            cparams.fused_gdn_ar = false;
+            LLAMA_LOG_WARN("%s: fused Gated Delta Net not supported, set to disabled\n", __func__);
+        }
     }
 
     // reserve worst-case graph
@@ -1039,16 +1117,24 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
-    if (n_adapters != loras->size()) {
-        return false;
-    }
+    // Adapters with a zero scale are never added to `loras`, so also ignore them for the comparison.
+    size_t n_non_zero = 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
+        if (scales[i] == 0.0f) {
+            continue;
+        }
+        n_non_zero++;
+
         auto it = loras->find(adapters[i]);
 
         if (it == loras->end() || it->second != scales[i]) {
             return false;
         }
+    }
+
+    if (n_non_zero != loras->size()) {
+        return false;
     }
 
     return true;
@@ -1114,6 +1200,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1759,6 +1846,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // APEX: evaluate scheduling after profiling warmup completes.
+    // The profiler data is communicated via apex_set_profiler_results() called from common/.
+    // Here we just check if we have pending results to evaluate.
+    if (!apex_profiling_done && apex_policy_state.pending_ffn_us > 0.0) {
+        apex_profiling_done = true;
+
+        double avg_ffn_us  = apex_policy_state.pending_ffn_us;
+        double avg_attn_us = apex_policy_state.pending_attn_us;
+
+        bool offload = apex_inline::evaluate_offload(avg_ffn_us, avg_attn_us);
+
+        if (offload) {
+            apex_policy_state.active              = true;
+            apex_policy_state.offload_start_layer = 0;
+            apex_policy_state.offload_end_layer   = model.hparams.n_layer - 1;
+
+            LLAMA_LOG_INFO("%s: APEX gate: offload=yes (ffn=%.1f us, attn=%.1f us)\n",
+                __func__, avg_ffn_us, avg_attn_us);
+            LLAMA_LOG_INFO("%s: APEX: offloading attention to CPU for layers %d-%d\n",
+                __func__, apex_policy_state.offload_start_layer, apex_policy_state.offload_end_layer);
+        } else {
+            LLAMA_LOG_INFO("%s: APEX gate: offload=no (ffn=%.1f us, attn=%.1f us) — GPU-only\n",
+                __func__, avg_ffn_us, avg_attn_us);
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -1981,7 +2094,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sched.get());
 
-    // when the scheduler is reset, we cannnot reuse the old graph, so we reset the previous graph result to prevent that
+    // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
 
     // store the n_outputs as it is, and restore it afterwards
@@ -2100,6 +2213,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }
+                    }
+                }
+            }
+        }
+
+        // APEX-driven attention offload to CPU (UMA bandwidth-aware scheduling)
+        // When the APEX inequality gate determines CPU offload is profitable,
+        // route attention ops to CPU backend to free GPU for bandwidth-heavy FFN.
+        if (apex_policy_state.active && il >= 0) {
+            if (il >= apex_policy_state.offload_start_layer &&
+                (apex_policy_state.offload_end_layer < 0 || il <= apex_policy_state.offload_end_layer)) {
+                if (apex_inline::is_attention_op(name)) {
+                    if (backend_cpu && ggml_backend_supports_op(backend_cpu, cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
                     }
                 }
             }
